@@ -1,4 +1,3 @@
-# l0_beta.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,8 +7,41 @@ import numpy as np
 from einops import einsum, rearrange
 from tqdm import tqdm
 import gc
+import contextlib, datetime
 from scipy.stats import beta
 import wandb
+
+# ────────────────────────── DEBUG UTILITIES ────────────────────────────
+def _stat(t):
+    """Return basic stats of a tensor as a dict."""
+    return dict(min=float(t.min()), max=float(t.max()), mean=float(t.mean()), std=float(t.std()))
+
+
+def _fmt(d):
+    return ("min={min:+.2e} max={max:+.2e} mean={mean:+.2e} std={std:+.2e}").format(**d)
+
+
+def _register_debug_hooks(module: nn.Module, log_every: int = 1):
+    """Attach gradient-logging hooks to all parameters in *module*.
+
+    Prints stats every `log_every` backward passes. The owning module must
+    maintain an integer attribute `_debug_step` that increments each
+    iteration (see integration in `run_training`).
+    """
+
+    for name, p in module.named_parameters():
+        def _make_hook(pname=name, param=p):
+            def _hook(grad):
+                step = getattr(module, "_debug_step", 0)
+                if step % log_every == 0:
+                    vstats = _fmt(_stat(param.data))
+                    gstats = _fmt(_stat(grad))
+                    finite = torch.isfinite(grad).all().item()
+                    print(f"[dbg {step:03d}] {pname:<20} | param {vstats} | grad {gstats} | finite={finite}")
+            return _hook
+
+        p.register_hook(_make_hook())
+# ───────────────────────────────────────────────────────────────────────
 
 class BetaMask(torch.nn.Module):
     """
@@ -64,21 +96,41 @@ class BetaMask(torch.nn.Module):
             self.param_shape = (num_neurons,)
         
         # Initialize parameters with proper shape
-        self.alpha_o = nn.Parameter(
+        self.alpha_raw = nn.Parameter(
+            self.softplus_inv(
             torch.clamp(
                 torch.randn(*self.param_shape, device=self.device) * 0.05 + lambda_e / 2, 
                 self.eps, lambda_e - self.eps
+                )
             )
         )
         
-        self.beta_o = nn.Parameter(
+        self.beta_raw = nn.Parameter(
+            self.softplus_inv(
             torch.clamp(
                 torch.randn(*self.param_shape, device=self.device) * 0.05 + lambda_e / 2, 
                 self.eps, lambda_e - self.eps
+                )
             )
         )
     
     
+    def softplus_inv(self, y):
+        # works down to y ≈ 1e-6 without overflow
+        return torch.where(
+            y < 20,
+            torch.log(torch.expm1(y)),        # stable for small y
+            y + torch.log1p(-torch.exp(-y))   # stable for large y
+        )
+    
+
+    def alpha_o(self):
+        return F.softplus(self.alpha_raw) + self.eps
+
+    def beta_o(self):
+        return F.softplus(self.beta_raw) + self.eps
+
+
     def forward(self, mode="sample"):
         """
         Just a convenience method. 
@@ -97,8 +149,13 @@ class BetaMask(torch.nn.Module):
         Returns:
             Tuple of (alpha_e, beta_e) with same shape as self.alpha_o and self.beta_o
         """
-        alpha_e = self.lambda_e * self.alpha_o / (self.alpha_o + self.beta_o)
-        beta_e  = self.lambda_e * self.beta_o / (self.alpha_o + self.beta_o)
+        if not hasattr(self, "alpha_o"):
+            print("alpha_o missing   *inside get_effective_params*")
+            print("current _buffers  :", list(self._buffers.keys())[:5])
+            print("current _parameters:", list(self._parameters.keys())[:5])
+
+        alpha_e = self.lambda_e * self.alpha_o() / (self.alpha_o() + self.beta_o())
+        beta_e  = self.lambda_e * self.beta_o() / (self.alpha_o() + self.beta_o())
         
         alpha_e = torch.clamp(alpha_e, min=self.eps)
         beta_e = torch.clamp(beta_e, min=self.eps)
@@ -232,7 +289,7 @@ class BetaMask(torch.nn.Module):
 
         # Calculate penalty for Beta parameters being too close together, not pushing enough of the density
         # towards zero and one
-        a_e, b_e = self.get_effective_parameters()
+        a_e, b_e = self.get_effective_params()
         penalty = torch.where(a_e < (self.lambda_e / 2), a_e, self.lambda_e - a_e)
         return log_loss + self.lambda_e * penalty.sum()
     
@@ -346,9 +403,11 @@ class GaussianCopulaMask(BetaMask):
                  seq_len=None,
                  batch_size=None,
                  device="cpu",
-                 binary_threshold=0.5):
-        super().__init__(num_neurons, lambda_e, lambda_beta, lambda_sim,
-                         stretch_left, stretch_right, epsilon, seq_len, device)
+                 binary_threshold=0.5,
+                 dtype=torch.bfloat16):
+        super().__init__(num_neurons=num_neurons, lambda_e=lambda_e, lambda_beta=lambda_beta, lambda_sim=lambda_sim,
+                         stretch_left=stretch_left, stretch_right=stretch_right,
+                         eps=epsilon, seq_len=seq_len, device=device)
         
         self.rank_k = rank_k
         # Lots of eps versions so don't recalculate bazillion times each iteration
@@ -363,13 +422,8 @@ class GaussianCopulaMask(BetaMask):
         self.batch_size = batch_size
         self.mean_ablations = None
         self.binary_threshold = binary_threshold
-        # Buffers to save memory in each forward pass. Sizes fall back to 1 when batch_size / seq_len is None
-        c_shape = (self.batch_size or 1, self.seq_len or 1, self.num_neurons)
-        y_shape = (self.batch_size or 1, self.seq_len or 1, self.rank_k)
-        self.register_buffer("_c_buf", torch.empty(*c_shape, dtype=torch.bfloat16))
-        self.register_buffer("_y_buf", torch.empty(*y_shape, dtype=torch.bfloat16))
-
-
+        self.dtype = dtype
+        
         # Initialize Q with appropriate shape based on by_token_Q
         if self.by_token_Q and self.seq_len is not None:
             # Token-specific Q: (seq_len, num_neurons, rank_k)
@@ -380,10 +434,17 @@ class GaussianCopulaMask(BetaMask):
         else:
             # Global Q: (num_neurons, rank_k)
             self.Q = nn.Parameter(self.create_initial_q_matrix(num_neurons, rank_k))
+        
+        # Buffers to save memory in each forward pass. Sizes fall back to 1 when batch_size / seq_len is None
+        c_shape = (self.batch_size or 1, self.seq_len or 1, self.num_neurons)
+        y_shape = (self.batch_size or 1, self.seq_len or 1, self.rank_k)
+        self.register_buffer("_c_buf", torch.empty(*c_shape, dtype=self.dtype, device=self.Q.device))
+        self.register_buffer("_y_buf", torch.empty(*y_shape, dtype=self.dtype, device=self.Q.device))
+
         # For use in complexity_loss
         self.epsilon_term = -self.num_neurons * torch.log(torch.tensor(self.epsilon, device=self.Q.device))
 
-    def create_initial_q_matrix(self, num_neurons, rank_k, token_dim=None):
+    def create_initial_q_matrix(self, num_neurons, rank_k, token_dim=None, dtype=torch.bfloat16):
         """
         Initialize Q matrix to approximate variance of 1 for each neuron mask
         
@@ -391,6 +452,7 @@ class GaussianCopulaMask(BetaMask):
             num_neurons: Number of neurons
             rank_k: Rank of the low-rank approximation
             token_dim: If not None, create a token-specific Q of shape (token_dim, num_neurons, rank_k)
+            dtype: Data type for the Q matrix
             
         Returns:
             Q matrix with appropriate shape
@@ -401,7 +463,7 @@ class GaussianCopulaMask(BetaMask):
             q_dims = (token_dim, num_neurons, rank_k)
             
         # Create token-specific Q matrices: (token_dim, num_neurons, rank_k)
-        Q = torch.randn(*q_dims, device=self.device)
+        Q = torch.randn(*q_dims, device=self.device, dtype=dtype)
         row_norms = Q.norm(dim=-1, keepdim=True)  # Compute L2 norm for each row
         Q = Q / row_norms  # Normalize so each row has norm 1
         return Q
@@ -433,7 +495,7 @@ class GaussianCopulaMask(BetaMask):
         return 0, 0
     
     
-    def sample_mask(self, cache_masks=False):
+    def sample_mask(self, cache_masks=False, verbose=False):
         """
         Sample correlated Gaussian variables with covariance (εI_n + QQ^T),
         then transform to Beta variables via copula.
@@ -467,99 +529,48 @@ class GaussianCopulaMask(BetaMask):
         # 2.  Add the Q-dependent term **with autograd enabled**
         # ------------------------------------------------------------------
         if not self.by_token_Q:                      # Q : (N, k)
-            z_shape = z.shape[:-1]                   # (..., N)
+            z_shape = z.shape[:-1]                   # All dims but the last (num_neurons). (B, T) currently
             z = ( z.reshape(-1, self.num_neurons) +
-                y.reshape(-1, self.rank_k) @ self.Q.T
+                  y.reshape(-1, self.rank_k) @ self.Q.T
                 ).reshape(*z_shape, self.num_neurons)
         else:                                        # Q : (T, N, k)
             # z, y :  (B, T, …)  or  (T, …) when batch_size is None
-            z = z + torch.einsum(
-                "t n k, ... t k -> ... t n", self.Q, y
-            )
+            z = z + torch.einsum("t n k, ... t k -> ... t n", self.Q, y)
 
+        # ------------------------------------------------------------------
+        # 3.  Φ  (std-normal CDF)  → uniform, **in-place**
+        # ------------------------------------------------------------------
+        z.div_(math.sqrt(2)).erf_().mul_(0.5).add_(0.5)   # z now holds u
+        u = z                                             # alias for clarity
 
-        # Force cleanup before starting
-        torch.cuda.empty_cache()
-        gc.collect()
+        if verbose:
+            self._log_memory("Created u")
 
-        # Handle different cases based on batch_size, seq_len, and by_token_Q
-        self._log_memory("Before creating c, y, and z_correlated")
-        if not self.by_token_Q:
-            # Q is (num_neurons, rank_k)
-            if self.batch_size is None and self.seq_len is None:
-                # z shape (num_neurons,)
-                c = torch.randn(self.num_neurons, device=self.Q.device)
-                y = torch.randn(self.rank_k, device=self.Q.device)
-                z_correlated = self.sqrt_epsilon * c + self.Q @ y
-            elif self.batch_size is None and self.seq_len is not None:
-                # z shape (seq_len, num_neurons)
-                c = torch.randn(self.seq_len, self.num_neurons, device=self.Q.device)
-                y = torch.randn(self.seq_len, self.rank_k, device=self.Q.device)
-                z_correlated = self.sqrt_epsilon * c + y @ self.Q.T
-            elif self.batch_size is not None and self.seq_len is None:
-                # z shape (self.batch_size, num_neurons)
-                c = torch.randn(self.batch_size, self.num_neurons, device=self.Q.device)
-                y = torch.randn(self.batch_size, self.rank_k, device=self.Q.device)
-                z_correlated = self.sqrt_epsilon * c + y @ self.Q.T
-            else: # self.batch_size is not None and seq_len is not None:
-                # z shape (self.batch_size, seq_len, num_neurons)
-                c = torch.randn(self.batch_size, self.seq_len, self.num_neurons, device=self.Q.device)
-                y = torch.randn(self.batch_size, self.seq_len, self.rank_k, device=self.Q.device)
-                z_correlated = self.sqrt_epsilon * c + y @ self.Q.T
-        else: # self.by_token_Q == True   ==>    seq_len is not None  (enforced in constructor)
-            # Q is (seq_len, num_neurons, rank_k). 
-            if self.batch_size is None:
-                # z shape (seq_len, num_neurons)
-                c = torch.randn(self.seq_len, self.num_neurons, device=self.Q.device)
-                y = torch.randn(self.seq_len, self.rank_k, device=self.Q.device)
-                z_correlated = self.sqrt_epsilon * c + einsum(self.Q, y,
-                                                         "token n_neurons rank_k, token rank_k -> token n_neurons")
-            else:
-                # Batch of samples for each token
-                c = torch.randn(self.batch_size, self.seq_len, self.num_neurons, device=self.Q.device)
-                y = torch.randn(self.batch_size, self.seq_len, self.rank_k, device=self.Q.device)
-                z_correlated = (self.sqrt_epsilon * c + 
-                                einsum(self.Q, y,
-                                       "token n_neurons rank_k, batch token rank_k -> batch token n_neurons"))
-        self._log_memory("Created c, y, and z_correlated")
+        # ------------------------------------------------------------------
+        # 4.  Beta ICDF   (keeps grad for alpha_o / beta_o)
+        # ------------------------------------------------------------------
+        alpha_e, beta_e = self.get_effective_params()     # on the tape
+        if verbose:
+            self._log_memory("Got effective params")
+        samples = ( self.fast_icdf(u, alpha_e)
+                    if hasattr(self, "fast_icdf")
+                    else torch.distributions.Beta(alpha_e, beta_e).icdf(u)
+                )
+        if verbose:
+            self._log_memory("Got samples")
 
-        # Transform to uniform via standard normal CDF
-        u = 0.5 * (1 + torch.erf(z_correlated / math.sqrt(2)))
-        self._log_memory("Created u")
-        
-        # Clean up z_correlated to save memory
-        del z_correlated, c, y
-        gc.collect()
-        torch.cuda.empty_cache()
-        self._log_memory("After cleanup of z_correlated, c, y")
-        
-        # Transform to Beta via inverse CDF
-        alpha_e, beta_e = self.get_effective_params()
-        self._log_memory("Got effective params")
-
-        if hasattr(self, "fast_icdf"):             # ← injected by SCM
-            samples = self.fast_icdf(u, alpha_e)   # fast table lookup
-        else:
-            dist = torch.distributions.Beta(alpha_e, beta_e)
-            samples = dist.icdf(u)                 # slow but always correct
-        self._log_memory("Got samples")
-        
-        # Clean up intermediate tensors
-        del u, alpha_e, beta_e
-        gc.collect()
-        torch.cuda.empty_cache()
-        self._log_memory("After cleanup of u, alpha_e, beta_e")
-
-        # Apply any stretching/clamping
+        # ------------------------------------------------------------------
+        # 5.  Stretch / clamp  +  optional cache
+        # ------------------------------------------------------------------
         samples = self.stretch_and_clamp_z(samples)
-        self._log_memory("Stretched and clamped")
-
+        if verbose:
+            self._log_memory("Stretched and clamped")
         if cache_masks:
             self.current_mask = samples
         return samples
 
 
-    def sample_mask_hi_mem(self, cache_masks=False):
+    def sample_mask_hi_mem(self, cache_masks=False, verbose=False):
         """
         Sample correlated Gaussian variables with covariance (εI_n + QQ^T),
         then transform to Beta variables via copula.
@@ -579,7 +590,8 @@ class GaussianCopulaMask(BetaMask):
         gc.collect()
 
         # Handle different cases based on batch_size, seq_len, and by_token_Q
-        self._log_memory("Before creating c, y, and z_correlated")
+        if verbose:
+            self._log_memory("Before creating c, y, and z_correlated")
         if not self.by_token_Q:
             # Q is (num_neurons, rank_k)
             if self.batch_size is None and self.seq_len is None:
@@ -617,38 +629,45 @@ class GaussianCopulaMask(BetaMask):
                 z_correlated = (self.sqrt_epsilon * c + 
                                 einsum(self.Q, y,
                                        "token n_neurons rank_k, batch token rank_k -> batch token n_neurons"))
-        self._log_memory("Created c, y, and z_correlated")
-
+        if verbose:
+            self._log_memory("Created c, y, and z_correlated")
+        
         # Transform to uniform via standard normal CDF
         u = 0.5 * (1 + torch.erf(z_correlated / math.sqrt(2)))
-        self._log_memory("Created u")
+        if verbose:
+            self._log_memory("Created u")
         
         # Clean up z_correlated to save memory
         del z_correlated, c, y
         gc.collect()
         torch.cuda.empty_cache()
-        self._log_memory("After cleanup of z_correlated, c, y")
+        if verbose:
+            self._log_memory("After cleanup of z_correlated, c, y")
         
         # Transform to Beta via inverse CDF
         alpha_e, beta_e = self.get_effective_params()
-        self._log_memory("Got effective params")
+        if verbose:
+            self._log_memory("Got effective params")
 
         if hasattr(self, "fast_icdf"):             # ← injected by SCM
             samples = self.fast_icdf(u, alpha_e)   # fast table lookup
         else:
             dist = torch.distributions.Beta(alpha_e, beta_e)
             samples = dist.icdf(u)                 # slow but always correct
-        self._log_memory("Got samples")
+        if verbose:
+            self._log_memory("Got samples")
         
         # Clean up intermediate tensors
         del u, alpha_e, beta_e
         gc.collect()
         torch.cuda.empty_cache()
-        self._log_memory("After cleanup of u, alpha_e, beta_e")
+        if verbose:
+            self._log_memory("After cleanup of u, alpha_e, beta_e")
 
         # Apply any stretching/clamping
         samples = self.stretch_and_clamp_z(samples)
-        self._log_memory("Stretched and clamped")
+        if verbose:
+            self._log_memory("Stretched and clamped")
 
         if cache_masks:
             self.current_mask = samples
@@ -670,7 +689,8 @@ class GaussianCopulaMask(BetaMask):
         beta_loss = super().complexity_loss(z)
 
         # Setup shared computations
-        I_k = torch.eye(self.rank_k, device=self.Q.device)
+        with torch.no_grad():
+            I_k = torch.eye(self.rank_k, device=self.Q.device)
 
         if not self.by_token_Q: # Q is (num_neurons, rank_k)
             # Compute Q-dependent terms (once)
@@ -687,7 +707,7 @@ class GaussianCopulaMask(BetaMask):
             if z.dim() == 1:  # (neurons,)
                 # No batch dimension - simple case
                 z_norm_term = -self.inv_epsilon * torch.sum(z ** 2)
-                Q_t_z = self.Q.T @ z
+                Q_t_z = self.Q.T @ z.to(self.Q.dtype)
                 quad_term = self.inv_epsilon_sqrd * (Q_t_z @ inv_matrix @ Q_t_z)
 
             elif z.dim() == 2:
@@ -697,21 +717,21 @@ class GaussianCopulaMask(BetaMask):
                 # the terms here the same regardless of whether or not we're doing per token models. As in, the likelihood
                 # is separate over batches but the sum over tokens. Either way just take the mean. It just washes out
                 # to a scalar on the lambda weights, so better to just learn one set of lambda weights.
-                z_norm_term = -self.inv_epsilon * torch.sum(z ** 2) / z.shape[0]
+                z_norm_term = -self.inv_epsilon * torch.sum(z.to(self.Q.dtype) ** 2) / z.shape[0]
                 # Vectorized quadratic term
-                Q_t_z_batch = z @ self.Q
+                Q_t_z_batch = z.to(self.Q.dtype) @ self.Q
                 quad_terms = torch.sum(Q_t_z_batch @ inv_matrix * Q_t_z_batch, dim=1)
                 quad_term = self.inv_epsilon_sqrd * torch.mean(quad_terms)
 
             else:  # z.dim() == 3, (batch, seq, neurons)
                 # Both batch and sequence dimensions
-                z_norm_term = -self.inv_epsilon * torch.sum(z ** 2, dim=-1).mean()
+                z_norm_term = -self.inv_epsilon * torch.sum(z.to(self.Q.dtype) ** 2, dim=-1).mean()
                 # Compute Q^T @ z for all vectors using einsum
                 # z: (batch, seq, neurons), Q: (neurons, rank_k) -> (batch, seq, rank_k)
-                Q_t_z = z @ self.Q                
+                Q_t_z = z.to(self.Q.dtype) @ self.Q                
                 # Compute quadratic term for all vectors: (Q^T @ z) @ inv_matrix @ (Q^T @ z)
                 # First Q_t_z @ inv_matrix: (batch, seq, rank_k) @ (rank_k, rank_k) -> (batch, seq, rank_k)
-                temp = einsum(Q_t_z, inv_matrix, "b s k1, k1 k2 -> b s k2")
+                temp = einsum(Q_t_z, inv_matrix.to(self.Q.dtype), "b s k1, k1 k2 -> b s k2")
                 # Then multiply with Q_t_z element-wise and sum over k dimension
                 # This computes sum_k (temp_ik * Q_t_z_ik) for each (batch, seq) pair
                 quad_terms = torch.sum(temp * Q_t_z, dim=-1)  # (batch, seq)
@@ -760,7 +780,7 @@ class GaussianCopulaMask(BetaMask):
 
 
 
-class SAECircuitMasker:
+class SAECircuitMasker(nn.Module):
     def __init__(self, 
                  saes,                  # List of SAE objects returned by:
                                         # [SAE.from_pretrained(release="gemma-scope-9b-pt-res",
@@ -786,7 +806,10 @@ class SAECircuitMasker:
                  binary_threshold=0.5,
                  mean_tokens=None,
                  sparsity_multiplier=1.0,  # Weight for complexity loss in total loss
-                 lambda_e_idx_dict=None):
+                 lambda_e_idx_dict=None,
+                 icdf_chunk=2**20,
+                 debug_grad_hooks=False):
+        super().__init__()
         
         self.saes = saes
         self.model_layer_to_sae_idx = {sae.cfg.hook_layer : i for i, sae in enumerate(saes)}
@@ -796,11 +819,13 @@ class SAECircuitMasker:
         self.per_token_mask = per_token_mask
         self.d_sae = saes[0].cfg.d_sae
         self.u_step = u_step
+        self.inv_u_step = 1 / self.u_step
+        self.alpha_step = alpha_step
+        self.inv_alpha_step = 1 / self.alpha_step
         u_steps_r = (1 / self.u_step) - 1
         self.u_steps   = int(np.round(u_steps_r))
         if u_steps_r != self.u_steps or self.u_steps < 2:
             raise ValueError(f"u_step ({self.u_step}) must divide evenly into 1.0")
-        self.alpha_step = alpha_step
         
         if lambda_e_idx_dict is None:
             self.lambda_e_idx_dict = {val : i for i, val in enumerate([1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0])}
@@ -814,9 +839,16 @@ class SAECircuitMasker:
             raise ValueError("All SAEs must have the same number of neurons, but got different values: " + str(nn))
 
         # Create the GaussianCopulaMask that covers ALL SAE neurons across ALL layers
-        total_neurons = len(saes) * nn[0]  # Total neurons = num_saes * d_sae_per_layer
+        self.num_neurons = len(saes) * nn[0]  # Total neurons = num_saes * d_sae_per_layer
         self.seq_len = seq_len if per_token_mask else None
-        self.gcm = GaussianCopulaMask(num_neurons=total_neurons,  # Changed from nn[0] to total_neurons
+        
+        self.icdf_chunk = icdf_chunk        # or tune per-GPU
+        # index buffer: need 4 × chunk int64 slots (u_lo, u_hi, a_lo, a_hi)
+        self.register_buffer("_icdf_int64", torch.empty(4 * self.icdf_chunk, dtype=torch.int64, device=self.device))
+        # bf16 scratch: need 4 × chunk slots (u_low, u_high, a_low, a_high)
+        self.register_buffer("_icdf_f32", torch.empty(4 * self.icdf_chunk, dtype=torch.float32, device=self.device))
+
+        self.gcm = GaussianCopulaMask(num_neurons=self.num_neurons,  # Changed from nn[0] to total_neurons
                                       lambda_e=lambda_e,
                                       lambda_beta=lambda_beta,
                                       lambda_sim=lambda_sim,
@@ -843,6 +875,35 @@ class SAECircuitMasker:
         #self.create_beta_icdf_lookup_table()
 
         self.sparsity_multiplier = sparsity_multiplier
+        self.debug_grad_hooks = debug_grad_hooks
+
+        # ------------------------------------------------------------------
+        # Optional: attach NaN/Inf-detecting gradient hooks to key parameters
+        # ------------------------------------------------------------------
+        if self.debug_grad_hooks:
+            try:
+                self.gcm.alpha_raw.register_hook(self._check_grad("alpha_raw"))
+                self.gcm.beta_raw .register_hook(self._check_grad("beta_raw"))
+                self.gcm.Q        .register_hook(self._check_grad("Q"))
+                print("[DEBUG] Parameter gradient hooks attached (alpha_raw, beta_raw, Q)")
+            except Exception as _e:
+                print(f"[DEBUG] Failed to attach parameter hooks: {_e}")
+
+        # flag fields for optional debug mode
+        self._grad_debug_steps = 0  # disabled by default
+
+
+    # ───────────────────────── DEBUG PUBLIC API ────────────────────────
+    def enable_grad_debug(self, n_steps: int = 1, *, log_every: int = 1):
+        """Enable gradient/parameter debugging for the next *n_steps*.
+
+        Args:
+            n_steps: number of training iterations to trace.
+            log_every: print stats every *log_every* backward calls.
+        """
+        self._grad_debug_steps = n_steps
+        _register_debug_hooks(self.gcm, log_every=log_every)
+    # ───────────────────────────────────────────────────────────────────────
 
     def running_mean_tensor(self, old_mean, new_value, n):
         return old_mean + (new_value - old_mean) / n
@@ -879,7 +940,7 @@ class SAECircuitMasker:
                 if i >= total_batches:
                     break
     
-    def create_beta_icdf_lookup_table(self, device="cuda", dtype=torch.float32):
+    def create_beta_icdf_lookup_table(self, device="cuda", dtype=torch.float32, verbose=False):
         """
         Create a lookup table for Beta ICDF values based on lambda parameter values.
         Uses fully vectorized operations for maximum efficiency.
@@ -922,16 +983,145 @@ class SAECircuitMasker:
             # to tensor and move to specified device
             # This will return a 2D array with shape (alpha_steps, self.u_step)
             table_cpu = torch.tensor(beta.ppf(u_grid, alpha_reshaped, beta_reshaped), dtype=dtype)
+            if verbose and (torch.isnan(table_cpu).any() or torch.isinf(table_cpu).any()):
+                print(f"[DEBUG] NaN or Inf inside lookup table for lambda_e = {lambda_e}")
             self.lookup_tables.append(table_cpu.to(device))
+
     
-    
-    def lookup_beta_icdf(self, u, alpha_e):
+
+    def lookup_beta_icdf(self, u, alpha_e, *, chunk: int = 2**20, verbose=False):
+        """
+        Beta-ICDF via fp16/bf16 table look-up, chunked to keep VRAM flat.
+        * Identical maths to the original version.
+        * Only `u_weight`, `a_weight`, and the final `interp` carry gradients.
+        * Peak extra memory  ≲  (chunk × 6 bytes)  (≈ 1–2 MB with default chunk).
+        """
+        u  = u.clamp_(self.u_step, 1.0 - self.u_step)          # (eps , 1−eps)
+        table = self.lookup_tables[self.lambda_e_idx_dict[self.gcm.lambda_e]]
+
+        # --- constants ----------------------------------------------------
+        u_min, u_max   =  self.u_step,     1.0 - self.u_step
+        a_min, a_max   =  self.alpha_step, self.gcm.lambda_e - self.alpha_step
+        n_alpha, n_u   =  table.shape[-2], table.shape[-1]
+
+        # --- flatten everything once -------------------------------------
+        flat_u         =  u.reshape(-1)
+        flat_out       =  torch.empty_like(flat_u, dtype=u.dtype)
+
+        # broadcast alpha_e to (B·T·N,) lazily
+        repeat_factor  =  flat_u.numel() // alpha_e.numel()
+        flat_alpha_e   =  alpha_e.repeat_interleave(repeat_factor)
+
+        # scratch buffers (views, no allocation)
+        work_int64     =  self._icdf_int64
+        work_f32       =  self._icdf_f32
+        if verbose:
+            self._log_memory("Initialized table and working variables")
+
+        # -----------------------------------------------------------------
+        for start in range(0, flat_u.numel(), self.icdf_chunk):
+            end                =  min(start + self.icdf_chunk, flat_u.numel())
+            u_chunk            =  flat_u[start:end]          # (C,)
+            alpha_chunk        =  flat_alpha_e[start:end]    # (C,)
+            C                  =  u_chunk.numel()            # chunk length
+
+            # -------------------------------------------------- no-grad ----
+            with torch.no_grad():
+                if verbose and torch.isnan(u_chunk).any():
+                    idx = torch.nonzero(torch.isnan(u_chunk))[:5].flatten().tolist()
+                    print(f"[DEBUG] u_chunk has NaN at positions {idx}")
+
+                if verbose and torch.isinf(u_chunk).any():
+                    idx = torch.nonzero(torch.isinf(u_chunk))[:5].flatten().tolist()
+                    print(f"[DEBUG] u_chunk has Inf at positions {idx}")
+                # ----- integer indices (int64, identical to old code) -----
+                u_idx_low   = torch.floor((u_chunk.float().clamp_(u_min, u_max) - u_min) * self.inv_u_step).long().clamp_(0, n_u - 1)
+                u_idx_high  = torch.clamp_(u_idx_low + 1, max=n_u - 1)
+                a_idx_low   = torch.floor((alpha_chunk.float().clamp_(a_min, a_max) - a_min) * self.inv_alpha_step).long().clamp_(0, n_alpha - 1)
+                a_idx_high  = torch.clamp_(a_idx_low + 1, max=n_alpha - 1)
+
+                # ----- store indices in reusable buffer -------------------
+                idx_view = work_int64[: 4 * C].view(4, C)
+                idx_view[0].copy_(u_idx_low)
+                idx_view[1].copy_(u_idx_high)
+                idx_view[2].copy_(a_idx_low)
+                idx_view[3].copy_(a_idx_high)
+                u_idx_low, u_idx_high, a_idx_low, a_idx_high = idx_view  # views
+
+                # ----- gather values ---------------------------------
+                val_00 = table[a_idx_low, u_idx_low]   # (C,)
+                val_01 = table[a_idx_low, u_idx_high]
+                val_10 = table[a_idx_high, u_idx_low]
+                val_11 = table[a_idx_high, u_idx_high]
+
+                # ----- grid points into f32 scratch ----------------------
+                grid_view = work_f32[: 4 * C].view(4, C)
+                u_low, u_high, a_low, a_high = grid_view     # views
+                
+                u_low.copy_(u_min + u_idx_low.to(torch.float32) * self.u_step)
+                u_high.copy_(u_low + self.u_step)
+                a_low.copy_(a_min + a_idx_low.to(torch.float32) * self.alpha_step)
+                a_high.copy_(a_low + self.alpha_step)
+
+            # -------------- weights (keep grad wrt alpha_e) ---------------
+            # Stable: guard denominator, replace non-finite results *before* clamp
+            # ─── DEBUG: detect zero-width cells away from table edges ────────────
+            if verbose:
+                bad_u = (u_high - u_low) <= 0
+                if bad_u.any():
+                    legal_u = (u_idx_low == u_idx_high) & (
+                            (u_idx_low == 0) | (u_idx_low == n_u - 1))
+                    unexpected = bad_u & (~legal_u)
+                    if unexpected.any():
+                        idx = torch.nonzero(unexpected)[:5].flatten().tolist()
+                        print(f"[DEBUG] Unexpected zero-width u-cell at positions {idx}")
+
+                bad_a = (a_high - a_low) <= 0
+                if bad_a.any():
+                    legal_a = (a_idx_low == a_idx_high) & (
+                            (a_idx_low == 0) | (a_idx_low == n_alpha - 1))
+                    unexpected = bad_a & (~legal_a)
+                    if unexpected.any():
+                        idx = torch.nonzero(unexpected)[:5].flatten().tolist()
+                        print(f"[DEBUG] Unexpected zero-width alpha-cell at positions {idx}")
+            # ─────────────────────────────────────────────────────────────────────
+            den_u = (u_high - u_low).clamp_min(1e-6)
+            den_a = (a_high - a_low).clamp_min(1e-6)
+
+            u_weight = (u_chunk.to(torch.float32) - u_low)  / den_u
+            a_weight = (alpha_chunk.to(torch.float32) - a_low) / den_a
+
+            # Replace NaN / ±Inf so ClampBackward never sees them
+            u_weight = torch.nan_to_num(u_weight, nan=0.5, posinf=1.0, neginf=0.0)
+            a_weight = torch.nan_to_num(a_weight, nan=0.5, posinf=1.0, neginf=0.0)
+
+            u_weight.clamp_(self.gcm.epsilon, 1.0 - self.gcm.epsilon)
+            a_weight.clamp_(self.gcm.epsilon, 1.0 - self.gcm.epsilon)
+
+            # -------------- bilinear interpolation (identical formula) ----
+            interp_chunk = (
+                val_00 * (1 - a_weight) * (1 - u_weight) +
+                val_01 * (1 - a_weight) *        u_weight +
+                val_10 *        a_weight  * (1 - u_weight) +
+                val_11 *        a_weight  *        u_weight
+            )
+
+            flat_out[start:end] = interp_chunk.to(u.dtype)
+            if verbose:
+                self._log_memory(f"Processed chunk {start:,} to {end:,}")
+            break
+
+        return flat_out.reshape_as(u)
+
+
+    def lookup_beta_icdf_hi_mem(self, u, alpha_e):
         """
         Fast Beta–ICDF via table look‑up.
         * Keeps gradients wrt `alpha_e`.
         * Never puts `u` or large table tensors in the autograd graph.
         * Uses fp16 tables to halve memory.
         """
+        u  = u.clamp_(self.u_step, 1.0 - self.u_step)          # (eps , 1−eps)
         table = self.lookup_tables[self.lambda_e_idx_dict[self.gcm.lambda_e]]
         u_min, u_max      =  self.u_step, 1.0 - self.u_step
         a_min, a_max      =  self.alpha_step, self.gcm.lambda_e - self.alpha_step
@@ -942,12 +1132,12 @@ class SAECircuitMasker:
         with torch.no_grad():
             # clamp & convert to integer indices
             u_idx_float     = (u.clamp(u_min, u_max) - u_min) / (u_max - u_min) * (n_u - 1)
-            u_idx_low       = torch.floor(u_idx_float).long()
+            u_idx_low       = torch.clamp(torch.floor(u_idx_float).long(), 0, n_u - 1)
             u_idx_high      = torch.clamp(u_idx_low + 1, max=n_u - 1)
             self._log_memory("Created high/low indices")
 
             a_idx_float     = (alpha_e.clamp(a_min, a_max) - a_min) / (a_max - a_min) * (n_alpha - 1)
-            a_idx_low       = torch.floor(a_idx_float).long()
+            a_idx_low       = torch.clamp(torch.floor(a_idx_float).long(), 0, n_alpha - 1)
             a_idx_high      = torch.clamp(a_idx_low + 1, max=n_alpha - 1)
             self._log_memory("Created high/low indices")
 
@@ -1073,12 +1263,12 @@ class SAECircuitMasker:
             print(f"[{stage}] VRAM - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
             return allocated, reserved
         return 0, 0
-    
+
 
     def cleanup_cuda(self):
-        torch.cuda.empty_cache()
         gc.collect()
-
+        torch.cuda.empty_cache()
+         
 
     def clear_cached_masks(self):
         """Clear any cached masks and force garbage collection"""
@@ -1273,7 +1463,8 @@ class SAECircuitMasker:
                      task="training",
                      loss_function='logit_diff',
                      portion_of_data=0.5,
-                     learning_rate=1.0):
+                     learning_rate=0.01,
+                     verbose=False):
         """
         Run training to find a minimal circuit using the beta-copula mask.
         
@@ -1291,7 +1482,7 @@ class SAECircuitMasker:
             loss_function: Type of loss to use ('logit_diff' or 'ce')
             portion_of_data: Fraction of dataset to use for training (0.0 to 1.0)
             learning_rate: Learning rate for Adam optimizer
-            
+        
         Returns:
             Dictionary containing:
                 - Final mask statistics and densities
@@ -1299,7 +1490,8 @@ class SAECircuitMasker:
                 - Final evaluation metrics (CE loss, logit diff)
                 - Active indices for each SAE layer
         """
-        self._log_memory("Training Start")
+        if verbose:
+            self._log_memory("Training Start")
         
         # Update hyperparameters in the GaussianCopulaMask only if provided
         if hyperparams is not None:
@@ -1330,36 +1522,44 @@ class SAECircuitMasker:
             **current_hyperparams  # Include all current hyperparameters in the config
         }
         wandb.init(project="sae circuits beta-copula", config=config)
-        self._log_memory("After wandb init")
+        if verbose:
+            self._log_memory("After wandb init")
         
         # Setup optimizer
         optimized_params = list(self.gcm.parameters())
         optimizer = optim.Adam(optimized_params, lr=learning_rate)
         total_steps = int(config["total_steps"] * 1.1)  # Allow for slight overrun
-        self._log_memory("After optimizer setup")
+        if verbose:
+            self._log_memory("After optimizer setup")
         
         # Get available lambda_e values from lookup tables (sorted in descending order)
         available_lambda_e_values = sorted(self.lambda_e_idx_dict.keys(), reverse=True)
-        print(f"Available lambda_e values: {available_lambda_e_values}")
+        if verbose:
+            print(f"Available lambda_e values: {available_lambda_e_values}")
         
         # Always start from the maximum lambda_e value
         lambda_e_schedule = available_lambda_e_values  # Start from max (4.0) down to min (1.0)
         num_stages = len(lambda_e_schedule)
+        if num_stages > total_steps:
+            print(f"Warning: num_stages ({num_stages}) is less than total_steps ({total_steps}).")
+            print(f"Adjusting total_steps to {num_stages}.")
+            total_steps = num_stages
         steps_per_stage = total_steps // num_stages if num_stages > 0 else total_steps
         
-        print(f"Lambda_e annealing schedule: {lambda_e_schedule}")
-        print(f"Steps per stage: {steps_per_stage}")
+        if verbose:
+            print(f"Lambda_e annealing schedule: {lambda_e_schedule}")
+            print(f"Steps per stage: {steps_per_stage}")
         
         # Training loop
         with tqdm(total=total_steps, desc="Training Progress") as pbar:
             for i, (x, y, z) in enumerate(zip(token_dataset, labels_dataset, corr_labels_dataset)):
                 try:
-                    if i == 0:  # Profile first iteration in detail
+                    if verbose:
                         self._log_memory(f"Step {i} - Start")
                     
                     # Zero gradients
                     optimizer.zero_grad()
-                    if i == 0:
+                    if verbose:
                         self._log_memory(f"Step {i} - After zero_grad")
                     
                     # Calculate ratio trained (for annealing)
@@ -1374,58 +1574,76 @@ class SAECircuitMasker:
                         # Fallback to original continuous annealing if only one stage
                         if available_lambda_e_values[0] > available_lambda_e_values[-1]:
                             current_lambda_e = available_lambda_e_values[-1]
-                            self.gcm.lambda_e = current_lambda_e
+                        self.gcm.lambda_e = current_lambda_e
                     
                     # Sample masks for this batch
-                    masks = self.sample_joint_masks()
-                    if i == 0:
+                    with torch.autograd.detect_anomaly():
+                        masks = self.sample_joint_masks()
+                    if verbose:
                         self._log_memory(f"Step {i} - After mask sampling")
                         print(f"Mask shape: {masks.shape if hasattr(masks, 'shape') else 'No shape attr'}")
                     
                     # Forward pass with current mask
-                    task_loss, complexity_loss, beta_loss, copula_loss = self._forward_pass(x, y, z, loss_function)
-                    if i == 0:
+                    with torch.autograd.detect_anomaly():
+                        task_loss, complexity_loss, beta_loss, copula_loss = self._forward_pass(x, y, z, loss_function, verbose=verbose)
+                    if verbose:
                         self._log_memory(f"Step {i} - After forward pass")
                     
-                    # Total loss combines task loss and complexity loss (which already includes all regularization terms)
+                    # Total loss combines task + regularisation
                     total_loss = task_loss + self.sparsity_multiplier * complexity_loss
-                    if i == 0:
+                    if verbose:
                         self._log_memory(f"Step {i} - After loss computation")
                     
-                    # Backward pass and optimizer step
-                    total_loss.backward()
-                    if i == 0:
+                    # ---------------- BACKWARD (with optional anomaly trace) --------
+                    debug_mode = self._grad_debug_steps > 0
+                    ctx = torch.autograd.detect_anomaly() if debug_mode else contextlib.nullcontext()
+                    with ctx:
+                        total_loss.backward()
+
+                    # decrement debug counter & expose step to hooks
+                    if debug_mode:
+                        self._grad_debug_steps -= 1
+                    self.gcm._debug_step = i
+
+                    if verbose:
                         self._log_memory(f"Step {i} - After backward")
                     
-                    optimizer.step()
-                    if i == 0:
-                        self._log_memory(f"Step {i} - After optimizer step")
+                    # ------------------ post-step parameter clamp -------------------
+                    with torch.no_grad():
+                        self.gcm.alpha_raw.clamp_(-10.0, 10.0)
+                        self.gcm.beta_raw .clamp_(-10.0, 10.0)
+                        self.gcm.Q        .clamp_(-3.0,  3.0)
+ 
+                    # ----------------------------------------------------------------
+                    # FREE UNUSED CUDA CACHES EACH STEP (prevents fragmentation & OOM)
+                    # ----------------------------------------------------------------
+                    gc.collect()
+                    torch.cuda.empty_cache()
                     
                     # Memory cleanup every few steps
-                    if i % 5 == 0:  # Clean up every 5 steps
+                    if i % 1 == 0:  # Clean up every 5 steps
                         del masks, task_loss, complexity_loss, total_loss
                         if beta_loss is not None:
                             del beta_loss
                         if copula_loss is not None:
                             del copula_loss
                         self.cleanup_cuda()
-                        torch.cuda.empty_cache()
-                        if i == 0:
-                            self._log_memory(f"Step {i} - After cleanup")
+                        # torch.cuda.empty_cache()
+                        self._log_memory(f"Step {i} - After cleanup")
                     
                     # Log stats (reduced frequency to save memory)
                     if i % 2 == 0:  # Log every 2 steps instead of every step
                         stats = {
                             "Step": i, 
                             "Progress": ratio_trained, 
-                            "Task Loss": task_loss.item() if 'task_loss' in locals() else 0,
-                            "Complexity Loss": complexity_loss.item() if 'complexity_loss' in locals() else 0,
+                                "Task Loss": task_loss.item() if 'task_loss' in locals() else 0,
+                                "Complexity Loss": complexity_loss.item() if 'complexity_loss' in locals() else 0,
                             "Current Lambda_e": self.gcm.lambda_e
                         }
                         wandb.log(stats)
-                        
+                    
                         # Update progress bar (less frequently)
-                        pbar.set_postfix({k: v for k, v in stats.items() if not isinstance(v, torch.Tensor)})
+                    pbar.set_postfix({k: v for k, v in stats.items() if not isinstance(v, torch.Tensor)})
                     
                     pbar.update(1)
                     
@@ -1502,9 +1720,9 @@ class SAECircuitMasker:
                     layer_mask = binary_masks[:, idx] if binary_masks.shape[1] > idx else binary_masks[:, 0]
                 else:
                     layer_mask = binary_masks
-                active_indices = torch.nonzero(layer_mask).flatten().tolist()
-                mask_dict[sae.cfg.hook_name] = active_indices
-                total_density += len(active_indices)
+            active_indices = torch.nonzero(layer_mask).flatten().tolist()
+            mask_dict[sae.cfg.hook_name] = active_indices
+            total_density += len(active_indices)
         
         mask_dict["total_density"] = total_density
         mask_dict['avg_density'] = total_density / len(self.saes)
@@ -1524,7 +1742,8 @@ class SAECircuitMasker:
         
         return mask_dict
 
-    def _forward_pass(self, batch, clean_label_tokens, corr_label_tokens, loss_function='logit_diff'):
+
+    def _forward_pass(self, batch, clean_label_tokens, corr_label_tokens, loss_function='logit_diff', verbose=False):
         """
         Perform a forward pass through the model with the current mask.
         
@@ -1533,7 +1752,7 @@ class SAECircuitMasker:
             clean_label_tokens: Correct answer token IDs [batch_size]
             corr_label_tokens: Incorrect answer token IDs [batch_size]
             loss_function: Type of loss to use ('logit_diff' or 'ce')
-            
+        
         Returns:
             Tuple of (task_loss, complexity_loss, beta_loss, copula_loss)
             - task_loss: Primary task loss (logit difference or cross-entropy)
@@ -1543,7 +1762,8 @@ class SAECircuitMasker:
         """
         
         # Log memory at start of forward pass
-        self._log_memory_fp("Forward Pass Start")
+        if verbose:
+            self._log_memory("Forward Pass Start")
         
         # Get model output with masked SAEs
         masked_logits = self.model.run_with_hooks(
@@ -1551,15 +1771,18 @@ class SAECircuitMasker:
             return_type="logits",
             fwd_hooks=self.build_hooks_list(batch, use_mask=True, mean_mask=True)
         )
-        self._log_memory_fp("After Masked Forward")
+        if verbose:
+            self._log_memory("After Masked Forward")
         
         # Get model output without masking (for reference)
-        model_logits = self.model.run_with_hooks(
-            batch,
-            return_type="logits",
-            fwd_hooks=self.build_hooks_list(batch, use_mask=False, mean_mask=False)
-        )
-        self._log_memory_fp("After Reference Forward")
+        with torch.no_grad(): 
+            model_logits = self.model.run_with_hooks(
+                batch,
+                return_type="logits",
+                fwd_hooks=self.build_hooks_list(batch, use_mask=False, mean_mask=False)
+            )
+        if verbose:
+            self._log_memory("After Reference Forward")
         
         # Calculate loss based on specified loss function
         if loss_function == 'ce':
@@ -1574,11 +1797,13 @@ class SAECircuitMasker:
         else:
             raise ValueError(f"Unsupported loss function: {loss_function}")
         
-        self._log_memory_fp("After Task Loss Computation")
+        if verbose:
+            self._log_memory("After Task Loss Computation")
         
         # Calculate complexity losses (beta and copula terms)
         complexity_loss = self.complexity_loss(self.gcm.current_mask)
-        self._log_memory_fp("After Complexity Loss")
+        if verbose:
+            self._log_memory("After Complexity Loss")
         
         # If the GaussianCopulaMask implementation exposes the individual loss components,
         # get them for monitoring purposes
@@ -1593,16 +1818,16 @@ class SAECircuitMasker:
             del fwd_logit_diff
         if 'model_logit_diff' in locals():
             del model_logit_diff
-            
-        self._log_memory_fp("After Cleanup")
+        if verbose:
+            self._log_memory("After Cleanup")
         self.cleanup_cuda()
         
-        return task_loss, complexity_loss, beta_loss, copula_loss
+        return task_loss, complexity_loss, beta_loss, copula_loss    
 
     def complexity_loss(self, z):
         """Compute complexity loss for the current mask"""
         return self.gcm.complexity_loss(z)
-
+    
     def save_masks(self, save_dir):
         """Save the current masks to disk"""
         pass    
@@ -1705,3 +1930,14 @@ class SAECircuitMasker:
         
         # Return mean logit difference or per-example differences
         return (clean_logits - corr_logits).mean() if not token_wise else (clean_logits - corr_logits)
+
+    # ------------------- INTERNAL: gradient-sanity hook ---------------
+    def _check_grad(self, name: str):
+        """Return a hook that prints a warning if *grad* contains NaN/Inf."""
+        def _hook(grad: torch.Tensor):
+            if torch.isnan(grad).any() or torch.isinf(grad).any():
+                bad_idx = torch.nonzero(~torch.isfinite(grad))
+                first = bad_idx[0].item() if bad_idx.numel() else -1
+                print(f"[GRAD-DEBUG] {name} has non-finite grad; first bad index {first}")
+        return _hook
+    # ------------------------------------------------------------------

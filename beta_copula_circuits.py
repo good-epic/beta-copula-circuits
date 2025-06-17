@@ -35,6 +35,16 @@ from beta_copula_mask import SAECircuitMasker
 from collections import defaultdict
 import mem
 
+#%%
+import inspect, beta_copula_mask as bcm
+
+print("Has alpha_o in BetaMask ?:",
+      any(" alpha_o(" in line for line in inspect.getsource(bcm.BetaMask).splitlines()))
+print("Has alpha_o in GaussianCopulaMask ?:",
+      any(" alpha_o(" in line for line in inspect.getsource(bcm.GaussianCopulaMask).splitlines()))
+
+
+
 # In[3]:
 #### Load Model ####
 ####################
@@ -70,7 +80,7 @@ print(f"Using Hugging Face cache directory: {hf_cache}")
 #model_name = "google/gemma-2-9b"  # Replace with the desired model name
 model_name = "gpt2-small"  # Replace with the desired model name
 print(f"Loading model: {model_name}...")
-model = HookedSAETransformer.from_pretrained(model_name, device=device, cache_dir=hf_cache, torch_dtype=torch.bfloat16)
+model = HookedSAETransformer.from_pretrained_no_processing(model_name, device=device, cache_dir=hf_cache, torch_dtype=torch.bfloat16)
 
 # Set pad_token_id and freeze model parameters
 pad_token_id = model.tokenizer.pad_token_id
@@ -194,7 +204,7 @@ check_cuda_memory()
 # In[5]:
 #### Data Setup ####
 ####################
-
+print("Loading Data...")
 # Define dropdown for task selection
 dropdown = "codereason/index/len6_digit1"  # @param ["sva/rc", "codereason/key/len5_digit1", "codereason/index/len6_digit1", "ioi/baba21"]
 
@@ -267,19 +277,19 @@ for entry in data:
         corr_data.append(entry['patch_prefix'])
         clean_labels.append(entry['clean_answer'])
         corr_labels.append(entry['patch_answer'])
-print(f"{len(clean_data)=}")
-print(f"{example_length=}")
-print(n_lens_clean)
-print(n_lens_corr)
+# print(f"{len(clean_data)=}")
+# print(f"{example_length=}")
+# print(n_lens_clean)
+# print(n_lens_corr)
 
 clean_tokens = model.to_tokens(clean_data[:N], prepend_bos=False)
 corr_tokens = model.to_tokens(corr_data[:N], prepend_bos=False)
 clean_label_tokens = model.to_tokens(clean_labels[:N], prepend_bos=False).squeeze(-1)
 corr_label_tokens = model.to_tokens(corr_labels[:N], prepend_bos=False).squeeze(-1)
-print(f"{clean_tokens.shape=}")
-print(f"{corr_tokens.shape=}")
-print(f"{clean_label_tokens.shape=}")
-print(f"{corr_label_tokens.shape=}")
+# print(f"{clean_tokens.shape=}")
+# print(f"{corr_tokens.shape=}")
+# print(f"{clean_label_tokens.shape=}")
+# print(f"{corr_label_tokens.shape=}")
 
 def logit_diff_fn(logits, clean_labels, corr_labels, token_wise=False):
     clean_logits = logits[torch.arange(logits.shape[0]), -1, clean_labels]
@@ -316,19 +326,13 @@ device = "cuda"
 #                             device=device)[0] for i in range(len(layers))]
 
 ## For GPT2-Small
-#layers= [3, 5, 7, 9]
-layers= [5, 9]
+layers= [3, 5, 7, 9]
+# layers= [5, 9]
 
 
 saes = [SAE.from_pretrained(release="jbloom/GPT2-Small-SAEs-Reformatted",
                             sae_id=f"blocks.{layer}.hook_resid_pre", 
                             device=device)[0] for layer in layers]
-
-## For now just set the parameter values here. Upgrade to config file or the like at some point. 
-import importlib
-import beta_copula_mask
-importlib.reload(beta_copula_mask)
-from beta_copula_mask import SAECircuitMasker
 
 SCM = SAECircuitMasker(saes=saes,
                        seq_len=example_length,
@@ -342,123 +346,88 @@ SCM = SAECircuitMasker(saes=saes,
                        binary_threshold=0.5,
                        mean_tokens=corr_tokens)
 
-print(SCM.lambda_e_idx_dict)
-SCM.create_beta_icdf_lookup_table()
+print("type MRO:", SCM.gcm.__class__.mro())
+print("instance dict keys that shadow class attrs:",
+      [k for k in SCM.gcm.__dict__.keys() if k in ("alpha_o", "beta_o")])
+
+#print(SCM.lambda_e_idx_dict)
+SCM.create_beta_icdf_lookup_table(verbose=True)
 
 
 #%%
 #### True vs SAE Reconstructed Logit Diff Sanity Check ####
 ###########################################################
 
-use_mask = False
-mean_mask = False
-avg_logit_diff = 0
-SCM.cleanup_cuda()
-with torch.no_grad():
-    for i in range(10):
-        logits = model(
-            clean_tokens[i]
-            )
-        ld = logit_diff_fn(logits, clean_label_tokens[i], corr_label_tokens[i])
-        print(ld)
-        avg_logit_diff += ld
-        del logits
-        SCM.cleanup_cuda()
-model.reset_hooks(including_permanent=True)
-model.reset_saes()
-avg_model_diff = (avg_logit_diff / 10).item()
-print("True Average LD: ", avg_model_diff)
+# use_mask = False
+# mean_mask = False
+# avg_logit_diff = 0
+# SCM.cleanup_cuda()
+# with torch.no_grad():
+#     for i in range(10):
+#         logits = model(
+#             clean_tokens[i]
+#             )
+#         ld = logit_diff_fn(logits, clean_label_tokens[i], corr_label_tokens[i])
+#         print(ld)
+#         avg_logit_diff += ld
+#         del logits
+#         SCM.cleanup_cuda()
+# model.reset_hooks(including_permanent=True)
+# model.reset_saes()
+# avg_model_diff = (avg_logit_diff / 10).item()
+# print("True Average LD: ", avg_model_diff)
 
 
-use_mask = False
-mean_mask = False
-avg_logit_diff = 0
-SCM.cleanup_cuda()
-with torch.no_grad():
-    for i in range(10):
-        logits = model.run_with_hooks(
-            clean_tokens[i],
-            return_type="logits",
-            prepend_bos=False,
-            fwd_hooks=SCM.build_hooks_list(clean_tokens[i], use_mask=False, mean_mask=False)
-            )
-        ld = logit_diff_fn(logits, clean_label_tokens[i], corr_label_tokens[i])
-        print(ld)
-        avg_logit_diff += ld
-        del logits
-        SCM.cleanup_cuda()
-model.reset_hooks(including_permanent=True)
-model.reset_saes()
-avg_logit_diff = (avg_logit_diff / 10).item()
-print("SAE Average LD: ", avg_logit_diff)
+# use_mask = False
+# mean_mask = False
+# avg_logit_diff = 0
+# SCM.cleanup_cuda()
+# with torch.no_grad():
+#     for i in range(10):
+#         logits = model.run_with_hooks(
+#             clean_tokens[i],
+#             return_type="logits",
+#             prepend_bos=False,
+#             fwd_hooks=SCM.build_hooks_list(clean_tokens[i], use_mask=False, mean_mask=False)
+#             )
+#         ld = logit_diff_fn(logits, clean_label_tokens[i], corr_label_tokens[i])
+#         print(ld)
+#         avg_logit_diff += ld
+#         del logits
+#         SCM.cleanup_cuda()
+# model.reset_hooks(including_permanent=True)
+# model.reset_saes()
+# avg_logit_diff = (avg_logit_diff / 10).item()
+# print("SAE Average LD: ", avg_logit_diff)
 
-ld_plain  = torch.tensor([ 0.3575, -0.0926, -0.3996,  0.5070, -0.1311,
-                          -0.0271,  0.4333, -0.1432, -0.1939,  0.4285])
-ld_recon  = torch.tensor([ 0.9971, -0.2210, -0.6975,  0.6570, -0.1431,
-                          -0.6729,  1.0169, -0.2781, -1.2534,  0.5531])
+# ld_plain  = torch.tensor([ 0.3575, -0.0926, -0.3996,  0.5070, -0.1311,
+#                           -0.0271,  0.4333, -0.1432, -0.1939,  0.4285])
+# ld_recon  = torch.tensor([ 0.9971, -0.2210, -0.6975,  0.6570, -0.1431,
+#                           -0.6729,  1.0169, -0.2781, -1.2534,  0.5531])
 
-r = torch.corrcoef(torch.vstack([ld_plain, ld_recon]))[0,1]
-flip_rate = (ld_plain.sign() != ld_recon.sign()).float().mean()
-print("Mean Absolute Difference: ", (ld_plain - ld_recon).abs().mean())
-print("Pearson r =", r.item())        # expect ~0.99
-print("Sign‑flip rate =", flip_rate)  # expect 0.0
+# r = torch.corrcoef(torch.vstack([ld_plain, ld_recon]))[0,1]
+# flip_rate = (ld_plain.sign() != ld_recon.sign()).float().mean()
+# print("Mean Absolute Difference: ", (ld_plain - ld_recon).abs().mean())
+# print("Pearson r =", r.item())        # expect ~0.99
+# print("Sign‑flip rate =", flip_rate)  # expect 0.0
 
-
-# In[20]:
-
-
-check_cuda_memory()
 #%%
-SCM.create_beta_icdf_lookup_table()
+import inspect, importlib, beta_copula_mask as bcm
+print("id(BetaMask in module):", id(bcm.BetaMask))
+print("id(gcm base class)    :", id(SCM.gcm.__class__.__mro__[1]))
+
+
 
 
 #%%
 SCM.sample_joint_masks()
 print("mask stats:", SCM.gcm.current_mask.min().item(),
                       SCM.gcm.current_mask.max().item())
-check_cuda_memory()
-
-#%%
-check_cuda_memory()
-
-
-#%%
 SCM.set_sae_means(corr_tokens)
 
-#%%
-for i, sae in enumerate(SCM.saes):
-    print(f"SAE {i}: d_sae =", sae.cfg.d_sae)
-
-print(f"Full mask shape: {SCM.gcm.current_mask.shape}")
-print(f"Full mask stats: min={SCM.gcm.current_mask.min().item():.4f}, max={SCM.gcm.current_mask.max().item():.4f}")
-
-# Show masks for each SAE layer
-for i, sae in enumerate(SCM.saes):
-    layer_mask = SCM.get_masks(layer=sae.cfg.hook_layer)
-    print(f"Layer {sae.cfg.hook_layer} mask shape: {layer_mask.shape}")
-    print(f"Layer {sae.cfg.hook_layer} mask head (first batch, first 10 tokens, first 5 neurons): {layer_mask[0, :10, :5]}")
-
-
-
-
-# In[19]:
-
-logits = model.run_with_hooks(
-    clean_tokens[0],
-    return_type="logits",
-    prepend_bos=False,
-    fwd_hooks=SCM.build_hooks_list(
-        clean_tokens[0],
-        use_mask=True,       # <- uses the mask you just sampled
-        mean_mask=True))     # <- replaces "off" latents with their mean
-
-ld = logit_diff_fn(logits, clean_label_tokens[0], corr_label_tokens[0])
-print("Logit‑diff with mask:", ld.item())
-
-
-# # Test Beta Copula Training
 
 # In[21]:
+# # Test Beta Copula Training
 
 print("="*50)
 print("TESTING BETA COPULA TRAINING")
@@ -470,9 +439,9 @@ print("Running a short training test with the new Beta Copula masking system..."
 # Define hyperparameters for the test
 test_hyperparams = {
     "sparsity_multiplier": 0.1,  # Low sparsity for quick test
-    "learning_rate": 1.0,
+    "learning_rate": 0.01,
         "batch_size": 16,
-    "total_steps": 5  # Just 5 steps for testing
+    "total_steps": 7  # Just 5 steps for testing
 }
 
 print(f"Test hyperparameters: {test_hyperparams}")
@@ -480,17 +449,21 @@ print(f"Mask shape would be: {SCM.gcm.current_mask.shape if hasattr(SCM.gcm, 'cu
 print(f"Total neurons: {len(SCM.saes) * SCM.saes[0].cfg.d_sae}")
 print(f"Seq len: {SCM.seq_len}")
 print(f"Batch size: {SCM.batch_size}")
+check_cuda_memory()
+
+SCM.enable_grad_debug(n_steps=999, log_every=1)
 
 # Run a short training test
 try:
     SCM.run_training(
-        token_dataset=clean_tokens[:5],  # Just first 5 batches
-        labels_dataset=clean_label_tokens[:5],
-        corr_labels_dataset=corr_label_tokens[:5],
+        token_dataset=clean_tokens[:7],  # Just first 7 batches
+        labels_dataset=clean_label_tokens[:7],
+        corr_labels_dataset=corr_label_tokens[:7],
         task=dropdown,
         loss_function='logit_diff',
         portion_of_data=1.0,  # Use all of the limited data
-        learning_rate=1.0
+        learning_rate=0.01,
+        verbose=True
     )
     print("\n✅ Training test completed successfully!")
     print("The Beta Copula masking system is working correctly.")
