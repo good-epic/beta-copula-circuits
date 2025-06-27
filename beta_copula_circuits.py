@@ -38,11 +38,17 @@ import mem
 #%%
 import inspect, beta_copula_mask as bcm
 
-print("Has alpha_o in BetaMask ?:",
-      any(" alpha_o(" in line for line in inspect.getsource(bcm.BetaMask).splitlines()))
-print("Has alpha_o in GaussianCopulaMask ?:",
-      any(" alpha_o(" in line for line in inspect.getsource(bcm.GaussianCopulaMask).splitlines()))
+###################################
+#### Params #######################
+###################################
 
+
+lambda_e      = 4.0
+lambda_beta   = 0.5
+lambda_sim    = 5.0
+lambda_diag   = 1.0
+lambda_Q      = 15.0
+lambda_copula = None
 
 
 # In[3]:
@@ -76,11 +82,15 @@ os.makedirs(hf_cache, exist_ok=True)
 os.environ["HF_HOME"] = hf_cache
 print(f"Using Hugging Face cache directory: {hf_cache}")
 
+os.environ["TRANSFORMERS_OFFLINE"]="1"
+os.environ["HF_HUB_OFFLINE"]="1"
+os.environ["HF_DATASETS_OFFLINE"]="1"
+
 # Load the model
 #model_name = "google/gemma-2-9b"  # Replace with the desired model name
 model_name = "gpt2-small"  # Replace with the desired model name
 print(f"Loading model: {model_name}...")
-model = HookedSAETransformer.from_pretrained_no_processing(model_name, device=device, cache_dir=hf_cache, torch_dtype=torch.bfloat16)
+model = HookedSAETransformer.from_pretrained_no_processing(model_name, device=device, cache_dir=hf_cache, torch_dtype=torch.bfloat16, )
 
 # Set pad_token_id and freeze model parameters
 pad_token_id = model.tokenizer.pad_token_id
@@ -334,11 +344,16 @@ saes = [SAE.from_pretrained(release="jbloom/GPT2-Small-SAEs-Reformatted",
                             sae_id=f"blocks.{layer}.hook_resid_pre", 
                             device=device)[0] for layer in layers]
 
+
 SCM = SAECircuitMasker(saes=saes,
                        seq_len=example_length,
                        model=model,
-                       lambda_e=4.0,
-                       lambda_beta=0.1,
+                       lambda_e=lambda_e,
+                       lambda_beta=lambda_beta,
+                       lambda_sim=lambda_sim,
+                       lambda_diag=lambda_diag,
+                       lambda_Q=lambda_Q,
+                       lambda_copula=lambda_copula,
                        stretch_right=(1 - 1e-5),
                        per_token_mask=True, #### NOTE!! Need to make sure False works too!!! ####
                        device=device,
@@ -426,7 +441,7 @@ print("mask stats:", SCM.gcm.current_mask.min().item(),
 SCM.set_sae_means(corr_tokens)
 
 
-# In[21]:
+#%%
 # # Test Beta Copula Training
 
 print("="*50)
@@ -438,7 +453,6 @@ print("Running a short training test with the new Beta Copula masking system..."
 
 # Define hyperparameters for the test
 test_hyperparams = {
-    "sparsity_multiplier": 0.1,  # Low sparsity for quick test
     "learning_rate": 0.01,
         "batch_size": 16,
     "total_steps": 7  # Just 5 steps for testing
@@ -451,19 +465,20 @@ print(f"Seq len: {SCM.seq_len}")
 print(f"Batch size: {SCM.batch_size}")
 check_cuda_memory()
 
-SCM.enable_grad_debug(n_steps=999, log_every=1)
+# SCM.enable_grad_debug(n_steps=999, log_every=1)
 
 # Run a short training test
 try:
     SCM.run_training(
-        token_dataset=clean_tokens[:7],  # Just first 7 batches
-        labels_dataset=clean_label_tokens[:7],
-        corr_labels_dataset=corr_label_tokens[:7],
+        token_dataset=clean_tokens,  # Just first 7 batches
+        labels_dataset=clean_label_tokens,
+        corr_labels_dataset=corr_label_tokens,
         task=dropdown,
         loss_function='logit_diff',
         portion_of_data=1.0,  # Use all of the limited data
         learning_rate=0.01,
-        verbose=True
+        epochs=1,
+        verbose=False
     )
     print("\n✅ Training test completed successfully!")
     print("The Beta Copula masking system is working correctly.")
@@ -475,61 +490,256 @@ except Exception as e:
 
 print("="*50)
 
-#%%
-mem.check_memory()
 
-# Simple training test with hyperparams override
-print("="*50)
-print("TESTING BETA COPULA TRAINING WITH HYPERPARAMS")
-print("="*50)
-
-# Hyperparameters for a short training test
-# hyperparams = {
-#     'lambda_e': 0.1,        # Lower for faster convergence
-#     'lambda_beta': 0.01,    # Reduced complexity penalty
-#     'lambda_sim': 0.01,     # Reduced similarity penalty  
-#     'lambda_diag': 0.01,    # Reduced diagonal penalty
-#     'lambda_Q': 0.001       # Reduced Q sparsity
-# }
-
-learning_rate = 1.0
-total_steps = 3  # Very short test
-
-#print(f"Using hyperparameters: {hyperparams}")
-print(f"Learning rate: {learning_rate}")
-print(f"Total steps: {total_steps}")
-
-try:
-    # Use smaller dataset for quick test
-    test_tokens = clean_tokens[:total_steps]
-    test_clean_labels = clean_label_tokens[:total_steps] 
-    test_corr_labels = corr_label_tokens[:total_steps]
-    
-    print(f"Test data shapes:")
-    print(f"  Tokens: {test_tokens.shape}")
-    print(f"  Clean labels: {test_clean_labels.shape}")
-    print(f"  Corrupted labels: {test_corr_labels.shape}")
-    
-    # Run training with hyperparams override
-    print("\nStarting training with hyperparams override...")
-    result = SCM.run_training(
-        test_tokens,
-        test_clean_labels, 
-        test_corr_labels,
-        #hyperparams=hyperparams,  # Override specific hyperparameters
-        task="hyperparams_test",
-        loss_function='logit_diff',
-        portion_of_data=1.0,  # Use all test data
-        learning_rate=learning_rate
-    )
-    
-    print("\nTraining with hyperparams completed successfully!")
-    print(f"Final results: {result}")
-    
-except Exception as e:
-    print(f"Error during training test: {e}")
-    import traceback
-    traceback.print_exc()
 
 #%%
-mem.check_memory()
+# ────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+# Analyze the learned parameters
+# ────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+print("="*50)
+print("ANALYZING LEARNED PARAMETERS")
+print("="*50)
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+# Create plots directory if it doesn't exist
+os.makedirs('plots', exist_ok=True)
+
+# ────────────────────────────────────────────────────────────────
+# Memory-efficient diagnostics for the low-rank covariance QQᵀ
+# ────────────────────────────────────────────────────────────────
+# Plot 1: Main loss components
+fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+
+import matplotlib as mpl
+mpl.rcParams['axes.formatter.limits'] = (-999, 999) 
+
+# Plot 1: Main loss components
+axes[0,0].plot(SCM.complexity_losses, label='Complexity Loss', color='blue')
+axes[0,0].plot(SCM.lhood_losses, label='Likelihood Loss', color='red')
+axes[0,0].plot(SCM.task_losses, label='Task Loss', color='green')
+axes[0,0].set_title('Main Loss Components')
+axes[0,0].set_xlabel('Iteration')
+axes[0,0].set_ylabel('Loss Value')
+axes[0,0].legend()
+axes[0,0].grid(True, alpha=0.3)
+
+# Plot 1: Main loss components
+axes[0,1].plot(SCM.task_losses, label='Task Loss', color='green')
+axes[0,1].set_title('Task (CE or Logit Diff) Loss Components')
+axes[0,1].set_xlabel('Iteration')
+axes[0,1].set_ylabel('Loss Value')
+axes[0,1].legend()
+axes[0,1].grid(True, alpha=0.3)
+
+
+# Plot 2: Individual loss components (unweighted)
+axes[1,0].plot(SCM.beta_log_losses, label='Beta Log Loss', color='purple')
+axes[1,0].plot(SCM.beta_sim_losses, label='Beta Sim Loss', color='orange')
+axes[1,0].plot(SCM.diag_penalties, label='Diagonal Penalty', color='brown')
+axes[1,0].plot(SCM.Q_sparsities, label='Q Sparsity', color='pink')
+axes[1,0].plot(SCM.copula_losses, label='Copula Loss', color='cyan')
+axes[1,0].set_title('Individual Loss Components (Unweighted)')
+axes[1,0].set_xlabel('Iteration')
+axes[1,0].set_ylabel('Loss Value')
+axes[1,0].legend()
+axes[1,0].grid(True, alpha=0.3)
+
+# Plot 3: Individual loss components (weighted by tuning parameters)
+axes[1,1].plot([x * SCM.gcm.lambda_sim for x in SCM.beta_sim_losses], label=f'Beta Sim Loss × {SCM.gcm.lambda_sim}', color='orange')
+axes[1,1].plot([x * SCM.gcm.lambda_diag for x in SCM.diag_penalties], label=f'Diagonal Penalty × {SCM.gcm.lambda_diag}', color='brown')
+axes[1,1].plot([x * SCM.gcm.lambda_Q for x in SCM.Q_sparsities], label=f'Q Sparsity × {SCM.gcm.lambda_Q}', color='pink')
+axes[1,1].plot([x * SCM.gcm.lambda_beta for x in SCM.beta_log_losses], label=f'Beta Log Loss × {SCM.gcm.lambda_beta}', color='purple')
+axes[1,1].plot([x * SCM.gcm.lambda_copula for x in SCM.copula_losses], label=f'Copula Loss × {SCM.gcm.lambda_copula}', color='cyan')
+axes[1,1].set_title('Individual Loss Components (Weighted by Tuning Parameters)')
+axes[1,1].set_xlabel('Iteration')
+axes[1,1].set_ylabel('Loss Value')
+axes[1,1].legend()
+axes[1,1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('plots/loss_components.png', dpi=300, bbox_inches='tight')
+if plt.isinteractive():
+    plt.show()
+
+# Plot 4: Effective parameters tracking (all in one graph)
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+# Plot 1: Mean effective alpha trend
+axes[0].plot(SCM.eff_alphas_mean, label='Mean Effective Alpha', color='blue', linewidth=2)
+axes[0].set_title('Mean Effective Alpha Trend')
+axes[0].set_xlabel('Iteration')
+axes[0].set_ylabel('Mean Alpha Value')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+# Plot 2: High parameter counts
+axes[1].plot(SCM.eff_alphas_high, label='High Alpha Count (>75% of lambda_e)', color='red', linewidth=2)
+axes[1].plot(SCM.eff_betas_high, label='High Beta Count (>75% of lambda_e)', color='green', linewidth=2)
+axes[1].set_title('High Parameter Counts')
+axes[1].set_xlabel('Iteration')
+axes[1].set_ylabel('Count')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('plots/effective_parameters.png', dpi=300, bbox_inches='tight')
+if plt.isinteractive():
+    plt.show()
+
+# Print summary statistics for effective parameters
+print("\nEFFECTIVE PARAMETERS SUMMARY:")
+print("-" * 40)
+print(f"Final Mean Alpha: {SCM.eff_alphas_mean[-1]:.6f}")
+print(f"Final High Alpha Count: {SCM.eff_alphas_high[-1]:.0f}")
+print(f"Final High Beta Count: {SCM.eff_betas_high[-1]:.0f}")
+print(f"Alpha Range: [{min(SCM.eff_alphas_mean):.6f}, {max(SCM.eff_alphas_mean):.6f}]")
+print(f"High Alpha Range: [{min(SCM.eff_alphas_high):.0f}, {max(SCM.eff_alphas_high):.0f}]")
+print(f"High Beta Range: [{min(SCM.eff_betas_high):.0f}, {max(SCM.eff_betas_high):.0f}]")
+
+
+
+# Print summary statistics for the loss components
+print("\nLOSS COMPONENT SUMMARY:")
+print("-" * 40)
+print(f"Final Task Loss: {SCM.task_losses[-1]:.6f}")
+print(f"Final Complexity Loss: {SCM.complexity_losses[-1]:.6f}")
+print(f"Final Likelihood Loss: {SCM.lhood_losses[-1]:.6f}")
+print(f"Final Beta Log Loss: {SCM.beta_log_losses[-1]:.6f}")
+print(f"Final Beta Sim Loss: {SCM.beta_sim_losses[-1]:.6f}")
+print(f"Final Diagonal Penalty: {SCM.diag_penalties[-1]:.6f}")
+print(f"Final Q Sparsity: {SCM.Q_sparsities[-1]:.6f}")
+print(f"Final Copula Loss: {SCM.copula_losses[-1]:.6f}")
+
+# Q : (N, k)
+Q = SCM.gcm.Q.detach().cpu().float()
+print(f"Q shape: {Q.shape}")
+
+# ---------- helpers -------------------------------------------
+def sample_dot_products(Q_: torch.Tensor, n_pairs: int = 50_000):
+    """Return *n_pairs* random off-diagonal dot-products of rows of *Q_*."""
+    N = Q_.shape[0]
+    idx_i = torch.randint(0, N, (n_pairs,))
+    idx_j = torch.randint(0, N, (n_pairs,))
+    return (Q_[idx_i] * Q_[idx_j]).sum(dim=1)
+
+# ---------- basic stats ---------------------------------------
+row_var     = (Q ** 2).sum(dim=1)                # diag of QQᵀ
+off_diag    = sample_dot_products(Q, 100_000)    # sample off-diag entries
+
+# Spectrum via small Gram matrix
+G       = Q.T @ Q                                # (k, k)
+eigvals = torch.linalg.eigvalsh(G)               # ascending order
+
+# Effective α/β params (for completeness)
+alpha_eff, beta_eff = SCM.gcm.get_effective_params()
+alpha_eff = alpha_eff.flatten().detach().cpu().float()
+beta_eff  = beta_eff.flatten().detach().cpu().float()
+
+# ---------- plots ---------------------------------------------
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+# 1) row variance
+axes[0].hist(row_var.numpy(), bins=100, color='black', alpha=0.7)
+axes[0].set_title('Row variance (diag QQᵀ)')
+axes[0].set_xlabel('‖qᵢ‖²')
+
+# 2) sampled off-diagonal dot products
+axes[1].hist(off_diag.numpy(), bins=200, color='red', alpha=0.7)
+axes[1].set_title('Sampled off-diag dot products')
+axes[1].set_xlabel('qᵢ · qⱼ,  i≠j')
+
+# 3) eigen-spectrum
+axes[2].semilogy(eigvals.flip(0).numpy())
+axes[2].set_title('Eigenvalues of QQᵀ (via QᵀQ)')
+axes[2].set_xlabel('rank index')
+
+plt.tight_layout()
+plt.savefig('plots/Q_matrix_analysis.png', dpi=300, bbox_inches='tight')
+if plt.isinteractive():
+    plt.show()
+
+# ---------- summary print -------------------------------------
+print("\nSUMMARY STATISTICS:")
+print("-" * 30)
+# Calculate quantiles for off-diagonal dot products
+quantiles = [99.9, 99, 97, 95, 90, 75, 60, 50, 40, 25, 10, 5, 3, 1, 0.1]
+off_diag_quantiles = torch.quantile(off_diag, torch.tensor([q/100 for q in quantiles]))
+
+print(f"Off-diagonal dot product quantiles:")
+for i, q in enumerate(quantiles):
+    print(f"  {q:4.1f}th percentile: {off_diag_quantiles[i]:8.4f}")
+
+print(f"Q matrix:  shape {Q.shape},  mean {Q.mean():.4f},  std {Q.std():.4f}, "
+      f"range [{Q.min():.4f}, {Q.max():.4f}]")
+
+print(f"Row variance  –  mean {row_var.mean():.4f},  std {row_var.std():.4f}, "
+      f"range [{row_var.min():.4f}, {row_var.max():.4f}]")
+
+print(f"Sampled off-diag dot products  –  mean {off_diag.mean():.4f},  "
+      f"std {off_diag.std():.4f},  range [{off_diag.min():.4f}, {off_diag.max():.4f}]")
+
+print(f"Eigenvalue spectrum  –  min {eigvals[0]:.4e},  max {eigvals[-1]:.4e}, "
+      f"condition {eigvals[-1]/eigvals[0]:.2e}")
+
+print(f"Effective α  –  mean {alpha_eff.mean():.4f}, std {alpha_eff.std():.4f}, "
+      f"range [{alpha_eff.min():.4f}, {alpha_eff.max():.4f}]")
+print(f"Effective β  –  mean {beta_eff.mean():.4f}, std {beta_eff.std():.4f}, "
+      f"range [{beta_eff.min():.4f}, {beta_eff.max():.4f}]")
+
+# Histogram of effective alpha and beta parameters
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+# Alpha histogram
+ax1.hist(alpha_eff.numpy(), bins=50, color='blue', alpha=0.7)
+ax1.set_title('Effective Alpha Parameters')
+ax1.set_xlabel('Alpha')
+ax1.set_ylabel('Frequency')
+
+# Beta histogram
+ax2.hist(beta_eff.numpy(), bins=50, color='red', alpha=0.7)
+ax2.set_title('Effective Beta Parameters')
+ax2.set_xlabel('Beta')
+ax2.set_ylabel('Frequency')
+
+plt.tight_layout()
+plt.savefig('plots/effective_params_histogram.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# Calculate percentages
+alpha_lt_025 = (alpha_eff < 0.25).float().mean() * 100
+alpha_gt_075 = (alpha_eff > 0.75).float().mean() * 100
+alpha_lt_05 = (alpha_eff < 0.5).float().mean() * 100
+
+beta_lt_025 = (beta_eff < 0.25).float().mean() * 100
+beta_gt_075 = (beta_eff > 0.75).float().mean() * 100
+beta_lt_05 = (beta_eff < 0.5).float().mean() * 100
+
+print("\nEFFECTIVE PARAMETER STATISTICS:")
+print("-" * 40)
+print(f"Alpha < 0.25:  {alpha_lt_025:.2f}%")
+print(f"Alpha > 0.75:  {alpha_gt_075:.2f}%")
+print(f"Alpha < 0.5:   {alpha_lt_05:.2f}%")
+print(f"Beta < 0.25:   {beta_lt_025:.2f}%")
+print(f"Beta > 0.75:   {beta_gt_075:.2f}%")
+print(f"Beta < 0.5:    {beta_lt_05:.2f}%")
+
+
+
+print("=" * 50)
+
+### --- END REPLACEMENT ---
+
+# %%
+print(SCM.gcm.Q.numel())
+print(SCM.gcm.Q.shape)
+-7e6 / SCM.gcm.Q.numel()
+
+# %%
+SCM.gcm.lambda_copula

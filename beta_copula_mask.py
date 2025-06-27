@@ -43,6 +43,35 @@ def _register_debug_hooks(module: nn.Module, log_every: int = 1):
         p.register_hook(_make_hook())
 # ───────────────────────────────────────────────────────────────────────
 
+## Running into optimization issues. When parameters are up against a boundary, we're clamping
+## them on the forward pass. But the gradient there can be extreme because of our functional
+## form. Basically when we have alpha/beta params of the Beta distribution < 1, we get steep
+## density explosions near 0 and 1. This can cause NaNs in the gradient. To fix, we use a custom
+## clamp that zeros out the gradient when it pushes the parameters further towards the boundary.
+## This is a hack, but it works.
+class OneWayClamp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lo, hi):
+        # save masks telling whether the original x was below or above the interval
+        ctx.save_for_backward(x < lo, x > hi)
+        return x.clamp(lo, hi)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        below, above = ctx.saved_tensors          # boolean masks
+        grad_out = torch.nan_to_num(grad_out, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # If value was below lo:   allow *positive* grad (push up), block ≤0
+        grad_out = torch.where(below & (grad_out <= 0), 0.0, grad_out)
+        # If value was above hi:   allow *negative* grad (push down), block ≥0
+        grad_out = torch.where(above & (grad_out >= 0), 0.0, grad_out)
+
+        return grad_out, None, None
+
+def one_way_clamp(x, lo, hi):
+    return OneWayClamp.apply(x, lo, hi)
+
+
 class BetaMask(torch.nn.Module):
     """
     Handles the marginal Beta-based distribution for each neuron's mask.
@@ -153,7 +182,7 @@ class BetaMask(torch.nn.Module):
             print("alpha_o missing   *inside get_effective_params*")
             print("current _buffers  :", list(self._buffers.keys())[:5])
             print("current _parameters:", list(self._parameters.keys())[:5])
-
+        
         alpha_e = self.lambda_e * self.alpha_o() / (self.alpha_o() + self.beta_o())
         beta_e  = self.lambda_e * self.beta_o() / (self.alpha_o() + self.beta_o())
         
@@ -204,7 +233,14 @@ class BetaMask(torch.nn.Module):
         dist = torch.distributions.Beta(alpha_e, beta_e)
         
         # Handle proper broadcasting for different input shapes
-        return dist.log_prob(z)
+        # Guard against singularities when z hits exactly 0 or 1.  We clamp the
+        # evaluation point to the open interval (eps, 1-eps) and replace any
+        # non-finite outputs with 0 so the loss remains well-defined and the
+        # gradient does not explode.
+        z_safe = z.clamp(self.eps, 1.0 - self.eps)
+        logp = dist.log_prob(z_safe)
+        logp = torch.nan_to_num(logp, nan=0.0, posinf=0.0, neginf=0.0)
+        return logp
     
     
     def beta_density(self, z):
@@ -282,16 +318,25 @@ class BetaMask(torch.nn.Module):
         batch_size = None
         # Sum over all dimensions except batch
         if z.dim() == 1:  # (neurons,)
-            log_loss = -torch.sum(log_density)
+            # log_loss = -torch.sum(log_density)
+            # Make the tuning parameters less dependent on model size
+            log_loss = -torch.mean(log_density)
         else: # z.dim() > 1:
             # (seq, neurons) or (batch, neurons) or (batch, seq, neurons)
-            log_loss = -torch.sum(log_density, dim=-1).mean()
+            # log_loss = -torch.sum(log_density, dim=-1).mean()
+            # Make the tuning parameters less dependent on model size
+            log_loss = -torch.mean(log_density)
 
         # Calculate penalty for Beta parameters being too close together, not pushing enough of the density
         # towards zero and one
         a_e, b_e = self.get_effective_params()
-        penalty = torch.where(a_e < (self.lambda_e / 2), a_e, self.lambda_e - a_e)
-        return log_loss + self.lambda_e * penalty.sum()
+        # Let's shift just to penalize alpha to encourage mask sparsity
+        # penalty = torch.where(a_e < (self.lambda_e / 2), a_e, self.lambda_e - a_e)
+        penalty = a_e.abs().mean()
+        # Don't multiply by tuning parameters here. Return unmodified penalty and scale by tuning
+        # parameters closer to final loss calculation
+        #return (log_loss, penalty.sum())
+        return (log_loss, penalty)
     
     
     def compute_expected_threshold_sparsity(self, batch_size=None, threshold=0.5):
@@ -393,11 +438,12 @@ class GaussianCopulaMask(BetaMask):
                  lambda_e,
                  lambda_beta, 
                  lambda_sim,
-                 rank_k=100,
-                 epsilon=1e-4,     # Small constant for εI_n term
                  lambda_diag=0.1,  # Weight for diagonal penalty
                  lambda_Q=0.01,    # Weight for Q sparsity penalty
+                 lambda_copula=None, # Weight for copula loss
                  by_token_Q=False, # Whether to use token-specific Q matrices
+                 rank_k=100,
+                 epsilon=1e-4,     # Small constant for εI_n term
                  stretch_left=1e-5,
                  stretch_right=(1 - 1e-5),
                  seq_len=None,
@@ -416,6 +462,7 @@ class GaussianCopulaMask(BetaMask):
         self.sqrt_epsilon = math.sqrt(epsilon)  # For εI_n
         self.epsilon_sqrd = epsilon ** 2        # For εI_n
         self.inv_epsilon_sqrd = 1 / (epsilon ** 2)        # For εI_n
+        
         self.lambda_diag = lambda_diag
         self.lambda_Q = lambda_Q
         self.by_token_Q = by_token_Q  # Whether Q varies by token position
@@ -434,6 +481,11 @@ class GaussianCopulaMask(BetaMask):
         else:
             # Global Q: (num_neurons, rank_k)
             self.Q = nn.Parameter(self.create_initial_q_matrix(num_neurons, rank_k))
+
+        if lambda_copula is None:
+            self.lambda_copula = 10.0 / self.Q.numel()
+        else:
+            self.lambda_copula = lambda_copula
         
         # Buffers to save memory in each forward pass. Sizes fall back to 1 when batch_size / seq_len is None
         c_shape = (self.batch_size or 1, self.seq_len or 1, self.num_neurons)
@@ -543,6 +595,16 @@ class GaussianCopulaMask(BetaMask):
         z.div_(math.sqrt(2)).erf_().mul_(0.5).add_(0.5)   # z now holds u
         u = z                                             # alias for clarity
 
+        # ─── DEBUG-U ──────────────────────────────────────────────
+        if torch.isnan(u).any() or torch.isinf(u).any():
+            bad = torch.nonzero(~torch.isfinite(u))[:10].flatten()
+            print("[BAD u] idx", bad.tolist(), "values", u.flatten()[bad])
+        alpha_e, beta_e = self.get_effective_params()
+        if torch.isnan(alpha_e).any() or torch.isinf(alpha_e).any():
+            bad = torch.nonzero(~torch.isfinite(alpha_e))[:10].flatten()
+            print("[BAD alpha_e] idx", bad.tolist(), alpha_e.flatten()[bad])
+        # ─────────────────────────────────────────────────────────
+
         if verbose:
             self._log_memory("Created u")
 
@@ -552,7 +614,7 @@ class GaussianCopulaMask(BetaMask):
         alpha_e, beta_e = self.get_effective_params()     # on the tape
         if verbose:
             self._log_memory("Got effective params")
-        samples = ( self.fast_icdf(u, alpha_e)
+        samples = ( self.fast_icdf(u, alpha_e, verbose=verbose)
                     if hasattr(self, "fast_icdf")
                     else torch.distributions.Beta(alpha_e, beta_e).icdf(u)
                 )
@@ -650,7 +712,7 @@ class GaussianCopulaMask(BetaMask):
             self._log_memory("Got effective params")
 
         if hasattr(self, "fast_icdf"):             # ← injected by SCM
-            samples = self.fast_icdf(u, alpha_e)   # fast table lookup
+            samples = self.fast_icdf(u, alpha_e, verbose=verbose)   # fast table lookup
         else:
             dist = torch.distributions.Beta(alpha_e, beta_e)
             samples = dist.icdf(u)                 # slow but always correct
@@ -674,7 +736,7 @@ class GaussianCopulaMask(BetaMask):
         return samples
 
 
-    def complexity_loss(self, z):
+    def complexity_loss(self, z, verbose=False):
         """
         Compute the negative log likelihood of the Gaussian copula plus penalties.
         Vectorized implementation that avoids explicit loops.
@@ -686,7 +748,12 @@ class GaussianCopulaMask(BetaMask):
             Total complexity loss (scalar)
         """
         # Get base Beta complexity loss
-        beta_loss = super().complexity_loss(z)
+        log_loss, sim_loss = super().complexity_loss(z)
+        beta_loss = self.lambda_beta * log_loss + self.lambda_sim * sim_loss
+        if verbose:
+            print(f"{log_loss=}")
+            print(f"{sim_loss=}")
+            print(f"{beta_loss=}")
 
         # Setup shared computations
         with torch.no_grad():
@@ -698,8 +765,13 @@ class GaussianCopulaMask(BetaMask):
             det_term = -torch.logdet(I_k + Q_t_Q)
             inv_matrix = torch.inverse(I_k + self.inv_epsilon * Q_t_Q)
             q_norms = torch.sum(self.Q ** 2, dim=1)
-            diag_penalty = self.lambda_diag * torch.sum((q_norms - 1.0) ** 2)
-            Q_sparsity = self.lambda_Q * torch.sum(torch.abs(self.Q))
+            # Unscaled penalties
+            # diag_penalty = torch.sum((q_norms - 1.0) ** 2)
+            # Q_sparsity = torch.sum(torch.abs(self.Q))
+
+            # Scale the penalties with mean so not on diff order of magnitude
+            diag_penalty = ((q_norms - 1.0) ** 2).mean()
+            Q_sparsity   = self.Q.abs().mean()
             # Averaging over batch, tokens, or both. Math derivation would be slightly different, but this keeps the terms
             # on the same scale and is just a question of scalars here or folded into the lambda terms
         
@@ -738,13 +810,16 @@ class GaussianCopulaMask(BetaMask):
                 # Average over both batch and sequence dimensions
                 quad_term = self.inv_epsilon_sqrd * torch.mean(quad_terms)
             # Combine all terms for the global Q case
-            copula_loss = det_term + self.epsilon_term + z_norm_term + quad_term + diag_penalty + Q_sparsity
-            return beta_loss + copula_loss
-
         else: # Token-specific Q (seq_len, num_neurons, rank_k)
             q_norms = torch.sum(self.Q ** 2, dim=-1)
-            diag_penalty = self.lambda_diag * torch.sum((q_norms - 1.0) ** 2, dim=-1).mean()
-            Q_sparsity = self.lambda_Q * torch.sum(torch.abs(self.Q), dim=(-1, -2)).mean()
+            # Unscaled penalties
+            # diag_penalty = torch.sum((q_norms - 1.0) ** 2, dim=-1).mean()
+            # Q_sparsity = torch.sum(torch.abs(self.Q), dim=(-1, -2)).mean()
+
+            # Scale the penalties with mean so not on diff order of magnitude
+            diag_penalty = ((q_norms - 1.0) ** 2).mean()
+            Q_sparsity   = self.Q.abs().mean()
+            
             # Mean over seq_len or (batch, seq_len)
             z_norm_term  = -self.inv_epsilon * torch.sum(z ** 2, dim=-1).mean()
             
@@ -774,8 +849,9 @@ class GaussianCopulaMask(BetaMask):
             # This computes sum_k (left_quad[t] * Q_t_z[t]) for each token or token and batch and takes
             # the overall mean
             quad_term    = torch.sum(left_quad * Q_t_z, dim=-1).mean()
-            copula_loss = det_term + self.epsilon_term + z_norm_term + quad_term + diag_penalty + Q_sparsity
-            return beta_loss + copula_loss
+        copula_loss = det_term + self.epsilon_term + z_norm_term + quad_term
+        
+        return (log_loss, sim_loss, diag_penalty, Q_sparsity, copula_loss)
 
 
 
@@ -793,10 +869,11 @@ class SAECircuitMasker(nn.Module):
                  lambda_e=4.0,          # Beta distribution parameter
                  lambda_beta=0.1,       # Weight for Beta log-density
                  lambda_sim=0.1,        # Weight for similarity penalty
-                 rank_k=500,            # Rank of covariance approximation
                  lambda_diag=0.1,       # Weight for diagonal penalty
                  lambda_Q=0.01,         # Weight for Q sparsity
+                 lambda_copula=None,     # Weight for copula loss
                  by_token_Q=False,      # Use token-specific Q matrices?
+                 rank_k=500,            # Rank of covariance approximation
                  stretch_left=1e-5,     # Minimum mask value
                  stretch_right=(1 - 1e-5), # Max mask value
                  per_token_mask=True,   # Whether to use token-specific masks
@@ -805,7 +882,6 @@ class SAECircuitMasker(nn.Module):
                  batch_size=16,
                  binary_threshold=0.5,
                  mean_tokens=None,
-                 sparsity_multiplier=1.0,  # Weight for complexity loss in total loss
                  lambda_e_idx_dict=None,
                  icdf_chunk=2**20,
                  debug_grad_hooks=False):
@@ -852,11 +928,12 @@ class SAECircuitMasker(nn.Module):
                                       lambda_e=lambda_e,
                                       lambda_beta=lambda_beta,
                                       lambda_sim=lambda_sim,
-                                      rank_k=rank_k,
-                                      epsilon=epsilon,
                                       lambda_diag=lambda_diag,
                                       lambda_Q=lambda_Q,
+                                      lambda_copula=lambda_copula,
                                       by_token_Q=by_token_Q,
+                                      rank_k=rank_k,
+                                      epsilon=epsilon,
                                       stretch_left=stretch_left,
                                       stretch_right=stretch_right,
                                       seq_len=seq_len,
@@ -874,9 +951,20 @@ class SAECircuitMasker(nn.Module):
 
         #self.create_beta_icdf_lookup_table()
 
-        self.sparsity_multiplier = sparsity_multiplier
         self.debug_grad_hooks = debug_grad_hooks
 
+        # Setup tracking for losses
+        self.beta_log_losses = []
+        self.beta_sim_losses = []
+        self.diag_penalties = []
+        self.Q_sparsities = []
+        self.copula_losses = []
+        self.complexity_losses = []
+        self.lhood_losses = []
+        self.task_losses = []
+        self.eff_alphas_mean = []
+        self.eff_alphas_high = []
+        self.eff_betas_high = []
         # ------------------------------------------------------------------
         # Optional: attach NaN/Inf-detecting gradient hooks to key parameters
         # ------------------------------------------------------------------
@@ -891,7 +979,7 @@ class SAECircuitMasker(nn.Module):
 
         # flag fields for optional debug mode
         self._grad_debug_steps = 0  # disabled by default
-
+        # NOTE: gradient-sanity hooks are now installed in `run_training`.
 
     # ───────────────────────── DEBUG PUBLIC API ────────────────────────
     def enable_grad_debug(self, n_steps: int = 1, *, log_every: int = 1):
@@ -1095,8 +1183,8 @@ class SAECircuitMasker(nn.Module):
             u_weight = torch.nan_to_num(u_weight, nan=0.5, posinf=1.0, neginf=0.0)
             a_weight = torch.nan_to_num(a_weight, nan=0.5, posinf=1.0, neginf=0.0)
 
-            u_weight.clamp_(self.gcm.epsilon, 1.0 - self.gcm.epsilon)
-            a_weight.clamp_(self.gcm.epsilon, 1.0 - self.gcm.epsilon)
+            u_weight = one_way_clamp(u_weight, self.gcm.epsilon, 1.0 - self.gcm.epsilon)
+            a_weight = one_way_clamp(a_weight, self.gcm.epsilon, 1.0 - self.gcm.epsilon)
 
             # -------------- bilinear interpolation (identical formula) ----
             interp_chunk = (
@@ -1169,90 +1257,6 @@ class SAECircuitMasker(nn.Module):
         self._log_memory("Created interpolation")
 
         return interp.to(u.dtype)            # match original dtype
-
-
-    # def lookup_beta_icdf(self, u, alpha_e):
-    #     """
-    #     Ultra-fast lookup function optimized for when all inputs have the same lambda_e value.
-    #     Memory-optimized version that detaches table lookups while preserving gradients through interpolation weights.
-        
-    #     Args:
-    #         u: Tensor of probability values (any shape)
-    #         alpha_e: Tensor of alpha parameters (same shape as u)
-        
-    #     Returns:
-    #         Interpolated ICDF values (same shape as u)
-    #     """
-
-    #     self._log_memory("Beginning of lookup_beta_icdf")
-    #     table = self.lookup_tables[self.lambda_e_idx_dict[self.gcm.lambda_e]]
-        
-    #     # Calculate grid parameters
-    #     u_min = self.u_step
-    #     u_max = 1 - self.u_step
-        
-    #     alpha_min = self.alpha_step
-    #     alpha_max = self.gcm.lambda_e - self.alpha_step
-    #     alpha_steps = int((alpha_max - alpha_min) / self.alpha_step) + 1
-        
-    #     # Clamp inputs to valid ranges
-    #     u = torch.clamp(u, u_min, u_max)
-    #     alpha_e = torch.clamp(alpha_e, alpha_min, alpha_max)
-    #     self._log_memory("Clamped inputs")
-
-    #     # Calculate indices in the grid - DETACH these since they're just for indexing
-    #     with torch.no_grad():
-    #         u_idx_low = torch.floor((u - u_min) / (u_max - u_min) * (self.u_steps - 1)).long()
-    #         u_idx_high = torch.where(u_idx_low + 1 >= self.u_steps, self.u_steps - 1, u_idx_low + 1)
-
-    #         alpha_idx_low = torch.floor((alpha_e - alpha_min) / (alpha_max - alpha_min) * (alpha_steps - 1)).long()
-    #         alpha_idx_high = torch.where(alpha_idx_low + 1 >= alpha_steps, alpha_steps - 1, alpha_idx_low + 1)
-    #         self._log_memory("Created high/low indices")
-
-    #         # Calculate grid values at these indices - also detached since they're just for interpolation
-    #         u_low_value = u_min + u_idx_low.float() * self.u_step
-    #         u_high_value = u_min + u_idx_high.float() * self.u_step
-    #         alpha_low_value = alpha_min + alpha_idx_low.float() * self.alpha_step
-    #         alpha_high_value = alpha_min + alpha_idx_high.float() * self.alpha_step
-    #         self._log_memory("Created high/low values")
-
-    #         # Lookup table values - detached since table doesn't need gradients
-    #         val_00 = table[alpha_idx_low, u_idx_low].detach()
-    #         val_01 = table[alpha_idx_low, u_idx_high].detach()
-    #         val_10 = table[alpha_idx_high, u_idx_low].detach()
-    #         val_11 = table[alpha_idx_high, u_idx_high].detach()
-    #         self._log_memory("Created values for interpolation")
-        
-    #     self._log_memory("Calculated indices and table values (detached)")
-
-    #     # Calculate interpolation weights - KEEP gradients for these since they depend on u and alpha_e
-    #     u_weight = torch.zeros_like(u)
-    #     u_diff_mask = (u_idx_high != u_idx_low)
-    #     u_weight[u_diff_mask] = (u[u_diff_mask] - u_low_value[u_diff_mask]) / (u_high_value[u_diff_mask] - u_low_value[u_diff_mask])
-    #     self._log_memory("Calculated u_weight")
-
-    #     alpha_weight = torch.zeros_like(alpha_e)
-    #     alpha_diff_mask = (alpha_idx_high != alpha_idx_low)
-    #     alpha_weight[alpha_diff_mask] = (alpha_e[alpha_diff_mask] - alpha_low_value[alpha_diff_mask]) / (alpha_high_value[alpha_diff_mask] - alpha_low_value[alpha_diff_mask])
-        
-    #     self._log_memory("Calculated interpolation weights (with gradients)")
-        
-    #     # Bilinear interpolation - gradients flow through the weights, not the table values
-    #     interp_result = (
-    #         val_00 * (1 - alpha_weight) * (1 - u_weight) +
-    #         val_01 * (1 - alpha_weight) * u_weight +
-    #         val_10 * alpha_weight * (1 - u_weight) +
-    #         val_11 * alpha_weight * u_weight
-    #     )
-    #     self._log_memory("Calculated interp_result")
-        
-    #     del u_idx_low, u_idx_high, alpha_idx_low, alpha_idx_high, u_low_value, u_high_value, alpha_low_value, \
-    #         alpha_high_value, u_weight, u_diff_mask, alpha_weight, alpha_diff_mask, val_00, val_01, val_10, val_11
-    #     gc.collect()
-    #     torch.cuda.empty_cache()
-    #     self._log_memory("Cleared intermediate variables")
-
-    #     return interp_result
 
 
     def _log_memory(self, stage):
@@ -1464,6 +1468,7 @@ class SAECircuitMasker(nn.Module):
                      loss_function='logit_diff',
                      portion_of_data=0.5,
                      learning_rate=0.01,
+                     epochs: int = 1,
                      verbose=False):
         """
         Run training to find a minimal circuit using the beta-copula mask.
@@ -1514,11 +1519,16 @@ class SAECircuitMasker(nn.Module):
         }
         print(f"Running training with hyperparameters: {current_hyperparams}")
         
-        # Configure wandb
+        # Configure wandb ---------------------------------------------------
+        dataset_size   = token_dataset.shape[0]
+        steps_per_epoch = int(dataset_size * portion_of_data)
+        total_steps     = steps_per_epoch * epochs
+
         config = {
             "batch_size": self.batch_size,
             "learning_rate": learning_rate,
-            "total_steps": token_dataset.shape[0] * portion_of_data,
+            "epochs": epochs,
+            "total_steps": total_steps,
             **current_hyperparams  # Include all current hyperparameters in the config
         }
         wandb.init(project="sae circuits beta-copula", config=config)
@@ -1528,149 +1538,168 @@ class SAECircuitMasker(nn.Module):
         # Setup optimizer
         optimized_params = list(self.gcm.parameters())
         optimizer = optim.Adam(optimized_params, lr=learning_rate)
-        total_steps = int(config["total_steps"] * 1.1)  # Allow for slight overrun
-        if verbose:
-            self._log_memory("After optimizer setup")
-        
-        # Get available lambda_e values from lookup tables (sorted in descending order)
+
+        # ---------------------------------------------------------------------
+        # One-time install: raise immediately on the first non-finite gradient
+        # ---------------------------------------------------------------------
+        def _throw_if_non_finite(grad, pname):
+            if not torch.isfinite(grad).all():
+                raise RuntimeError(
+                    f"Non-finite gradient detected in '{pname}': "
+                    f"min {grad.min().item():.3e}, max {grad.max().item():.3e}"
+                )
+            return grad        # keep the gradient unchanged
+
+        for pname, p in self.gcm.named_parameters():
+            p.register_hook(lambda g, n=pname: _throw_if_non_finite(g, n))
+        # ---------------------------------------------------------------------
+
+        # Allow slight over-run so progress bar reaches 100 %
+        total_steps = int(total_steps * 1.05)
+
+        # ---------------------------------------------------------------
+        # No data copying: we will loop over the same mini-batches `epochs`
+        # times.  This keeps memory flat even for very large datasets.
+        # ---------------------------------------------------------------
+
+        # ----------------------------------------------------------------
+        # Get available lambda_e values for the annealing schedule
+        # ----------------------------------------------------------------
         available_lambda_e_values = sorted(self.lambda_e_idx_dict.keys(), reverse=True)
+        lambda_e_schedule = available_lambda_e_values
+        num_stages = len(lambda_e_schedule)
+        steps_per_stage = max(1, total_steps // num_stages)
+
         if verbose:
             print(f"Available lambda_e values: {available_lambda_e_values}")
-        
-        # Always start from the maximum lambda_e value
-        lambda_e_schedule = available_lambda_e_values  # Start from max (4.0) down to min (1.0)
-        num_stages = len(lambda_e_schedule)
-        if num_stages > total_steps:
-            print(f"Warning: num_stages ({num_stages}) is less than total_steps ({total_steps}).")
-            print(f"Adjusting total_steps to {num_stages}.")
-            total_steps = num_stages
-        steps_per_stage = total_steps // num_stages if num_stages > 0 else total_steps
-        
-        if verbose:
             print(f"Lambda_e annealing schedule: {lambda_e_schedule}")
             print(f"Steps per stage: {steps_per_stage}")
-        
-        # Training loop
+
+        # ----------------------------------------------------------------
+        # Original training loop (now over the repeated dataset)
+        # ----------------------------------------------------------------
         with tqdm(total=total_steps, desc="Training Progress") as pbar:
-            for i, (x, y, z) in enumerate(zip(token_dataset, labels_dataset, corr_labels_dataset)):
-                try:
-                    if verbose:
-                        self._log_memory(f"Step {i} - Start")
-                    
-                    # Zero gradients
-                    optimizer.zero_grad()
-                    if verbose:
-                        self._log_memory(f"Step {i} - After zero_grad")
-                    
-                    # Calculate ratio trained (for annealing)
-                    ratio_trained = i / total_steps
-                    
-                    # Staged lambda_e annealing through discrete values
-                    if num_stages > 1:
-                        current_stage = min(i // steps_per_stage, num_stages - 1)
-                        current_lambda_e = lambda_e_schedule[current_stage]
-                        self.gcm.lambda_e = current_lambda_e
-                    else:
-                        # Fallback to original continuous annealing if only one stage
-                        if available_lambda_e_values[0] > available_lambda_e_values[-1]:
-                            current_lambda_e = available_lambda_e_values[-1]
-                        self.gcm.lambda_e = current_lambda_e
-                    
-                    # Sample masks for this batch
-                    with torch.autograd.detect_anomaly():
-                        masks = self.sample_joint_masks()
-                    if verbose:
-                        self._log_memory(f"Step {i} - After mask sampling")
-                        print(f"Mask shape: {masks.shape if hasattr(masks, 'shape') else 'No shape attr'}")
-                    
-                    # Forward pass with current mask
-                    with torch.autograd.detect_anomaly():
-                        task_loss, complexity_loss, beta_loss, copula_loss = self._forward_pass(x, y, z, loss_function, verbose=verbose)
-                    if verbose:
-                        self._log_memory(f"Step {i} - After forward pass")
-                    
-                    # Total loss combines task + regularisation
-                    total_loss = task_loss + self.sparsity_multiplier * complexity_loss
-                    if verbose:
-                        self._log_memory(f"Step {i} - After loss computation")
-                    
-                    # ---------------- BACKWARD (with optional anomaly trace) --------
-                    debug_mode = self._grad_debug_steps > 0
-                    ctx = torch.autograd.detect_anomaly() if debug_mode else contextlib.nullcontext()
-                    with ctx:
-                        total_loss.backward()
-
-                    # decrement debug counter & expose step to hooks
-                    if debug_mode:
-                        self._grad_debug_steps -= 1
-                    self.gcm._debug_step = i
-
-                    if verbose:
-                        self._log_memory(f"Step {i} - After backward")
-                    
-                    # ------------------ post-step parameter clamp -------------------
-                    with torch.no_grad():
-                        self.gcm.alpha_raw.clamp_(-10.0, 10.0)
-                        self.gcm.beta_raw .clamp_(-10.0, 10.0)
-                        self.gcm.Q        .clamp_(-3.0,  3.0)
- 
-                    # ----------------------------------------------------------------
-                    # FREE UNUSED CUDA CACHES EACH STEP (prevents fragmentation & OOM)
-                    # ----------------------------------------------------------------
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    
-                    # Memory cleanup every few steps
-                    if i % 1 == 0:  # Clean up every 5 steps
-                        del masks, task_loss, complexity_loss, total_loss
-                        if beta_loss is not None:
-                            del beta_loss
-                        if copula_loss is not None:
-                            del copula_loss
-                        self.cleanup_cuda()
-                        # torch.cuda.empty_cache()
-                        self._log_memory(f"Step {i} - After cleanup")
-                    
-                    # Log stats (reduced frequency to save memory)
-                    if i % 2 == 0:  # Log every 2 steps instead of every step
-                        stats = {
-                            "Step": i, 
-                            "Progress": ratio_trained, 
-                                "Task Loss": task_loss.item() if 'task_loss' in locals() else 0,
-                                "Complexity Loss": complexity_loss.item() if 'complexity_loss' in locals() else 0,
-                            "Current Lambda_e": self.gcm.lambda_e
-                        }
-                        wandb.log(stats)
-                    
-                        # Update progress bar (less frequently)
-                    pbar.set_postfix({k: v for k, v in stats.items() if not isinstance(v, torch.Tensor)})
-                    
-                    pbar.update(1)
-                    
-                    # Check if we've reached the end
-                    if i >= total_steps:
-                        break
+            for epoch in range(epochs):
+                for batch_idx, (x, y, z) in enumerate(zip(token_dataset, labels_dataset, corr_labels_dataset)):
+                    if batch_idx >= steps_per_epoch:
+                        break  # portion_of_data < 1.0
+                    i = epoch * steps_per_epoch + batch_idx  # preserve old variable name inside body
+                    try:
+                        if verbose:
+                            self._log_memory(f"Step {i} - Start")
                         
-                except KeyboardInterrupt:
-                    print("Training interrupted by user.")
-                    break
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        print(f"Out of memory at step {i}!")
-                        self._log_memory(f"OOM at step {i}")
-                        # Try to recover
-                        self.cleanup_cuda()
+                        # Zero gradients
+                        optimizer.zero_grad()
+                        if verbose:
+                            self._log_memory(f"Step {i} - After zero_grad")
+                        
+                        # Calculate ratio trained (for annealing)
+                        ratio_trained = i / total_steps
+                        
+                        # Staged lambda_e annealing through discrete values
+                        if num_stages > 1:
+                            current_stage = min(i // steps_per_stage, num_stages - 1)
+                            current_lambda_e = lambda_e_schedule[current_stage]
+                            self.gcm.lambda_e = current_lambda_e
+                        else:
+                            # Fallback to original continuous annealing if only one stage
+                            if available_lambda_e_values[0] > available_lambda_e_values[-1]:
+                                current_lambda_e = available_lambda_e_values[-1]
+                            self.gcm.lambda_e = current_lambda_e
+                        
+                        # Sample masks for this batch (enable anomaly detection only in debug)
+                        ctx_mgr = torch.autograd.detect_anomaly() if self._grad_debug_steps > 0 else contextlib.nullcontext()
+                        with ctx_mgr:
+                            masks = self.sample_joint_masks()
+                        if verbose:
+                            self._log_memory(f"Step {i} - After mask sampling")
+                            print(f"Mask shape: {masks.shape if hasattr(masks, 'shape') else 'No shape attr'}")
+                        
+                        # Forward pass with current mask
+                        ctx_mgr = torch.autograd.detect_anomaly() if self._grad_debug_steps > 0 else contextlib.nullcontext()
+                        with ctx_mgr:
+                            total_loss = self._forward_pass(x, y, z, loss_function, verbose=verbose)
+                        if verbose:
+                            self._log_memory(f"Step {i} - After forward pass")
+                            print(f"{total_loss=}")
+                        
+                        # ---------------- BACKWARD ---------------------------
+                        ctx_mgr = torch.autograd.detect_anomaly() if self._grad_debug_steps > 0 else contextlib.nullcontext()
+                        with ctx_mgr:
+                            total_loss.backward()
+
+                        # Apply parameter update
+                        optimizer.step()
+
+                        # decrement debug counter & expose step to hooks
+                        if self._grad_debug_steps > 0:
+                            self._grad_debug_steps -= 1
+                        self.gcm._debug_step = i
+
+                        if verbose:
+                            self._log_memory(f"Step {i} - After backward")
+                        
+                        # ------------------ post-step parameter clamp -------------------
+                        with torch.no_grad():
+                            self.gcm.alpha_raw.clamp_(-10.0, 10.0)
+                            self.gcm.beta_raw .clamp_(-10.0, 10.0)
+                            self.gcm.Q        .clamp_(-3.0,  3.0)
+ 
+                        # ----------------------------------------------------------------
+                        # FREE UNUSED CUDA CACHES EACH STEP (prevents fragmentation & OOM)
+                        # ----------------------------------------------------------------
+                        gc.collect()
                         torch.cuda.empty_cache()
-                        if 'total_loss' in locals():
-                            del total_loss
-                        if 'masks' in locals():
-                            del masks
-                        self._log_memory(f"After OOM cleanup")
-                        raise e
-                    else:
-                        raise e
+                        
+                        # Memory cleanup every few steps
+                        if i % 1 == 0:  # Clean up every 5 steps
+                            del masks, total_loss
+                            self.cleanup_cuda()
+                            # torch.cuda.empty_cache()
+                            if verbose:
+                                self._log_memory(f"Step {i} - After cleanup")
+                        
+                        # Log stats (reduced frequency to save memory)
+                        if i % 2 == 0:  # Log every 2 steps instead of every step
+                            stats = {
+                                "Step": i, 
+                                "Progress": ratio_trained, 
+                                    "Task Loss": task_loss.item() if 'task_loss' in locals() else 0,
+                                    "Complexity Loss": complexity_loss.item() if 'complexity_loss' in locals() else 0,
+                                "Current Lambda_e": self.gcm.lambda_e
+                            }
+                            wandb.log(stats)
+                        
+                            # Update progress bar (less frequently)
+                        pbar.set_postfix({k: v for k, v in stats.items() if not isinstance(v, torch.Tensor)})
+                        
+                        pbar.update(1)
+                        
+                        # Check if we've reached the end
+                        if i >= total_steps:
+                            break
+                            
+                    except KeyboardInterrupt:
+                        print("Training interrupted by user.")
+                        break
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            print(f"Out of memory at step {i}!")
+                            self._log_memory(f"OOM at step {i}")
+                            # Try to recover
+                            self.cleanup_cuda()
+                            torch.cuda.empty_cache()
+                            if 'total_loss' in locals():
+                                del total_loss
+                            if 'masks' in locals():
+                                del masks
+                            self._log_memory(f"After OOM cleanup")
+                            raise e
+                        else:
+                            raise e
         
-        self._log_memory("After training loop")
+        if verbose:
+            self._log_memory("After training loop")
         
         # Finish wandb logging
         wandb.finish()
@@ -1800,18 +1829,44 @@ class SAECircuitMasker(nn.Module):
         if verbose:
             self._log_memory("After Task Loss Computation")
         
-        # Calculate complexity losses (beta and copula terms)
-        complexity_loss = self.complexity_loss(self.gcm.current_mask)
+        # Calculate losses
+        beta_log_loss, beta_sim_loss, diag_penalty, Q_sparsity, copula_loss = self.complexity_loss(self.gcm.current_mask, verbose=verbose)
+        complexity_loss = self.gcm.lambda_sim * beta_sim_loss + self.gcm.lambda_diag * diag_penalty + self.gcm.lambda_Q * Q_sparsity
+        lhood_loss = self.gcm.lambda_beta * beta_log_loss + self.gcm.lambda_copula * copula_loss
+        total_loss = task_loss + complexity_loss + lhood_loss
+
+        # Save losses
+        self.beta_log_losses.append(beta_log_loss.detach().cpu().item())
+        self.beta_sim_losses.append(beta_sim_loss.detach().cpu().item())
+        self.diag_penalties.append(diag_penalty.detach().cpu().item())
+        self.Q_sparsities.append(Q_sparsity.detach().cpu().item())
+        self.copula_losses.append(copula_loss.detach().cpu().item())
+        self.complexity_losses.append(complexity_loss.detach().cpu().item())
+        self.lhood_losses.append(lhood_loss.detach().cpu().item())
+        self.task_losses.append(task_loss.detach().cpu().item())
+        effective_params = self.gcm.get_effective_params()
+        self.eff_alphas_mean.append((effective_params[0] / self.gcm.lambda_e).mean().detach().cpu().item())
+        self.eff_alphas_high.append(((effective_params[1] / self.gcm.lambda_e) > 0.7).float().sum().detach().cpu().item())
+        self.eff_betas_high.append(((effective_params[1] / self.gcm.lambda_e) > 0.7).float().sum().detach().cpu().item())
         if verbose:
             self._log_memory("After Complexity Loss")
-        
-        # If the GaussianCopulaMask implementation exposes the individual loss components,
-        # get them for monitoring purposes
-        beta_loss = getattr(self.gcm, "beta_loss", None)
-        copula_loss = getattr(self.gcm, "copula_loss", None)
+            print(f"{complexity_loss=}") if complexity_loss is not None else print("complexity_loss is None!")
+            print(f"{type(complexity_loss)=}") if complexity_loss is not None else None
+            print(f"{beta_log_loss=}") if beta_log_loss is not None else print("beta_log_loss is None!")
+            print(f"{type(beta_log_loss)=}") if beta_log_loss is not None else None
+            print(f"{beta_sim_loss=}") if beta_sim_loss is not None else print("beta_sim_loss is None!")
+            print(f"{type(beta_sim_loss)=}") if beta_sim_loss is not None else None
+            print(f"{diag_penalty=}") if diag_penalty is not None else print("diag_penalty is None!")
+            print(f"{type(diag_penalty)=}") if diag_penalty is not None else None
+            print(f"{Q_sparsity=}") if Q_sparsity is not None else print("Q_sparsity is None!")
+            print(f"{type(Q_sparsity)=}") if Q_sparsity is not None else None
+            print(f"{copula_loss=}") if copula_loss is not None else print("copula_loss is None!")
+            print(f"{type(copula_loss)=}") if copula_loss is not None else None
         
         # Clean up intermediate tensors to save memory
         del model_logits, masked_logits
+        del beta_log_loss, beta_sim_loss, diag_penalty, Q_sparsity, copula_loss
+        del complexity_loss, lhood_loss, task_loss
         if 'last_token_logits' in locals():
             del last_token_logits
         if 'fwd_logit_diff' in locals():
@@ -1822,11 +1877,11 @@ class SAECircuitMasker(nn.Module):
             self._log_memory("After Cleanup")
         self.cleanup_cuda()
         
-        return task_loss, complexity_loss, beta_loss, copula_loss    
+        return total_loss
 
-    def complexity_loss(self, z):
+    def complexity_loss(self, z, verbose=False):
         """Compute complexity loss for the current mask"""
-        return self.gcm.complexity_loss(z)
+        return self.gcm.complexity_loss(z, verbose=verbose)
     
     def save_masks(self, save_dir):
         """Save the current masks to disk"""
